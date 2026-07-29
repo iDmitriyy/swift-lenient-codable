@@ -148,6 +148,47 @@ struct DictionaryDecodingTests {
             #expect(catalog.stock[9]! == nil)          // bad value padded
         }
     }
+
+    @Suite("LenientDecoding.nilPaddingOptional (dictionary)")
+    struct DictionaryNilPaddingOptionalTests {
+        private func json(extras: String) -> String {
+            #"{ "scores": {}, "regions": {}, "stock": {}, "extras": \#(extras) }"#
+        }
+
+        @Test("missing key → nil (not [:])")
+        func missingKey() throws {
+            let catalog = try decode(Catalog.self, #"{ "scores": {}, "regions": {}, "stock": {} }"#)
+            #expect(catalog.extras == nil)
+        }
+
+        @Test("JSON null → nil")
+        func nullDictionary() throws {
+            let catalog = try decode(Catalog.self, json(extras: "null"))
+            #expect(catalog.extras == nil)
+        }
+
+        @Test("value is not an object → nil")
+        func notAnObject() throws {
+            let catalog = try decode(Catalog.self, json(extras: "3"))
+            #expect(catalog.extras == nil)
+        }
+
+        @Test("empty object → [:] (present but empty ≠ absent)")
+        func emptyObject() throws {
+            let catalog = try decode(Catalog.self, json(extras: "{}"))
+            #expect(catalog.extras != nil)
+            #expect(catalog.extras?.isEmpty == true)
+        }
+
+        @Test("actual object → padded exactly like nilPadding")
+        func actualObject() throws {
+            let catalog = try decode(Catalog.self, json(extras: #"{ "a": 1, "b": "x" }"#))
+            let extras = try #require(catalog.extras)
+            #expect(extras.count == 2)
+            #expect(extras["a"]! == 1)
+            #expect(extras["b"]! == nil)
+        }
+    }
 }
 
 // MARK: - Helper types
@@ -163,14 +204,16 @@ private struct Catalog: Decodable {
     let scores: [String: Int?]
     let regions: [Region: Price?]
     let stock: [Int: Int?]
+    let extras: [String: Int?]?
 
-    enum CodingKeys: CodingKey { case scores, regions, stock }
+    enum CodingKeys: CodingKey { case scores, regions, stock, extras }
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.scores = LenientDecoding.nilPadding(String.self, Int.self, in: container, forKey: .scores, decoder: decoder)
         self.regions = LenientDecoding.nilPadding(Region.self, Price.self, in: container, forKey: .regions, decoder: decoder)
         self.stock = LenientDecoding.nilPadding(Int.self, Int.self, in: container, forKey: .stock, decoder: decoder)
+        self.extras = LenientDecoding.nilPaddingOptional(String.self, Int.self, in: container, forKey: .extras, decoder: decoder)
     }
 }
 

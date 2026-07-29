@@ -21,6 +21,7 @@ import Foundation
 /// | `[T?]?` | `@NilOnFailure` (or implicit) | ``nilPaddingOptional(_:in:forKey:decoder:)`` |
 /// | `[T]` | `@DropOnFailure` | ``dropOnFailure(_:in:forKey:decoder:)`` |
 /// | `[K: V?]` | `@NilOnFailure` (or implicit) | ``nilPadding(_:_:in:forKey:decoder:)`` |
+/// | `[K: V?]?` | `@NilOnFailure` (or implicit) | ``nilPaddingOptional(_:_:in:forKey:decoder:)`` |
 ///
 /// - Note: `@Strict` properties bypass this type entirely — they decode with
 ///   the normal synthesized behavior (`decode` for non-optionals,
@@ -64,6 +65,7 @@ import Foundation
 ///
 /// ### Entry-level leniency
 /// - ``nilPadding(_:_:in:forKey:decoder:)``
+/// - ``nilPaddingOptional(_:_:in:forKey:decoder:)``
 public enum LenientDecoding {
     /// Whole-value leniency: any failure decodes as `nil`.
     ///
@@ -350,6 +352,52 @@ public enum LenientDecoding {
             return [:]
         }
 
+        return decodeNilPaddedValues(K.self, V.self, from: nested, path: path)
+    }
+
+    /// As ``nilPadding(_:_:in:forKey:decoder:)``, but an absent or unusable
+    /// object decodes as `nil` instead of `[:]`.
+    ///
+    /// Backs `@NilOnFailure` (explicit or implicit) on a `[K: V?]?` property.
+    /// The outer optional in `[K: V?]?` answers exactly one question: what
+    /// does "no dictionary at all" decode to.
+    ///
+    /// | Input | Result | Reported |
+    /// |-------|--------|----------|
+    /// | missing key | `nil` | yes ("key not found") |
+    /// | JSON `null` | `nil` | no (intentional null) |
+    /// | value is not an object | `nil` | yes |
+    /// | an actual object | entry-padded exactly as ``nilPadding(_:_:in:forKey:decoder:)`` | per entry |
+    ///
+    /// Use this shape when "the object was omitted" and "the object is empty"
+    /// mean different things to the caller.
+    ///
+    /// - Parameters:
+    ///   - keyType: The dictionary key type `K` to convert JSON keys to.
+    ///   - valueType: The value type `V` to decode.
+    ///   - container: The keyed container to read from.
+    ///   - key: The key holding the object.
+    ///   - decoder: The decoder for the value being initialized. Accepted for
+    ///     call-site uniformity of macro-generated code; currently unused.
+    /// - Returns: The decoded entries with `nil` at every key whose value
+    ///   failed, or `nil` when there is no usable object at `key`.
+    public static func nilPaddingOptional<K: LenientDictionaryKey, V: Decodable, Key: CodingKey>(
+        _ keyType: K.Type,
+        _ valueType: V.Type,
+        in container: KeyedDecodingContainer<Key>,
+        forKey key: Key,
+        decoder: any Decoder
+    ) -> [K: V?]? {
+        let path = LenientErrorLogger.path(of: container, key: key)
+        guard container.contains(key) else {
+            LenientErrorLogger.log("decoded nil for '\(path)' — key not found")
+            return nil
+        }
+        if (try? container.decodeNil(forKey: key)) == true { return nil }
+        guard let nested = try? container.nestedContainer(keyedBy: AnyCodingKey.self, forKey: key) else {
+            LenientErrorLogger.log("decoded nil for '\(path)' — value is not an object that can be converted to [:]")
+            return nil
+        }
         return decodeNilPaddedValues(K.self, V.self, from: nested, path: path)
     }
 
