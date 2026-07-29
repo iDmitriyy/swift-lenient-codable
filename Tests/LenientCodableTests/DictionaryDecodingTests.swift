@@ -63,4 +63,117 @@ struct DictionaryDecodingTests {
             #expect(IntLevel(lenientKeyString: "two") == nil)
         }
     }
+
+    @Suite("LenientDecoding.nilPadding (dictionary)")
+    struct DictionaryNilPaddingTests {
+        private func catalogJSON(scores: String) -> String {
+            #"{ "scores": \#(scores), "regions": {}, "stock": {} }"#
+        }
+
+        @Test("all entries valid → full dictionary")
+        func allValid() throws {
+            let catalog = try decode(Catalog.self, catalogJSON(scores: #"{ "math": 90, "art": 75 }"#))
+            #expect(catalog.scores == ["math": 90, "art": 75])
+        }
+
+        @Test("broken value → nil at that key, other entries survive")
+        func brokenValuePads() throws {
+            let catalog = try decode(Catalog.self, catalogJSON(scores: #"{ "math": 90, "art": "high" }"#))
+            #expect(catalog.scores.count == 2)
+            #expect(catalog.scores["math"] == 90)
+            #expect(catalog.scores["art"]! == nil)
+        }
+
+        @Test("null value → nil at that key (intentional null, silent)")
+        func nullValue() throws {
+            let catalog = try decode(Catalog.self, catalogJSON(scores: #"{ "math": null }"#))
+            #expect(catalog.scores.count == 1)
+            #expect(catalog.scores["math"]! == nil)
+        }
+
+        @Test("missing key → [:]")
+        func missingKey() throws {
+            let catalog = try decode(Catalog.self, #"{ "regions": {}, "stock": {} }"#)
+            #expect(catalog.scores == [:])
+        }
+
+        @Test("JSON null → [:]")
+        func nullDictionary() throws {
+            let catalog = try decode(Catalog.self, catalogJSON(scores: "null"))
+            #expect(catalog.scores == [:])
+        }
+
+        @Test("value is not an object → [:]")
+        func notAnObject() throws {
+            let catalog = try decode(Catalog.self, catalogJSON(scores: "[1, 2]"))
+            #expect(catalog.scores == [:])
+        }
+
+        @Test("empty object → [:]")
+        func emptyObject() throws {
+            let catalog = try decode(Catalog.self, catalogJSON(scores: "{}"))
+            #expect(catalog.scores == [:])
+        }
+
+        @Test("unknown enum key → entry dropped, others survive")
+        func unknownEnumKeyDropped() throws {
+            let json = #"{ "scores": {}, "regions": { "eu": { "amount": 9.99 }, "asia": { "amount": 5 } }, "stock": {} }"#
+            let catalog = try decode(Catalog.self, json)
+            #expect(catalog.regions.count == 1)
+            #expect(catalog.regions[.eu] == Price(amount: 9.99))
+        }
+
+        @Test("non-numeric Int key → entry dropped")
+        func badIntKeyDropped() throws {
+            let json = #"{ "scores": {}, "regions": {}, "stock": { "7": 100, "abc": 5 } }"#
+            let catalog = try decode(Catalog.self, json)
+            #expect(catalog.stock.count == 1)
+            #expect(catalog.stock[7]! == 100)
+        }
+
+        @Test("keys colliding after conversion keep one entry")
+        func keyCollisionAfterConversion() throws {
+            let json = #"{ "scores": {}, "regions": {}, "stock": { "7": 1, "07": 2 } }"#
+            let catalog = try decode(Catalog.self, json)
+            #expect(catalog.stock.count == 1)
+            #expect(catalog.stock[7] != nil)
+        }
+
+        @Test("bad key AND bad value in one object")
+        func mixedFailures() throws {
+            let json = #"{ "scores": {}, "regions": {}, "stock": { "7": 100, "abc": 5, "9": "x" } }"#
+            let catalog = try decode(Catalog.self, json)
+            #expect(catalog.stock.count == 2)          // "abc" dropped
+            #expect(catalog.stock[7]! == 100)
+            #expect(catalog.stock[9]! == nil)          // bad value padded
+        }
+    }
+}
+
+// MARK: - Helper types
+private enum Region: String, LenientDictionaryKey { case eu, us }
+
+private struct Price: Decodable, Equatable {
+    let amount: Double
+}
+
+/// Exercises the dictionary `nilPadding` helper across all three key kinds:
+/// `String` (identity), enum (`RawRepresentable` extension), and `Int` (parse).
+private struct Catalog: Decodable {
+    let scores: [String: Int?]
+    let regions: [Region: Price?]
+    let stock: [Int: Int?]
+
+    enum CodingKeys: CodingKey { case scores, regions, stock }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.scores = LenientDecoding.nilPadding(String.self, Int.self, in: container, forKey: .scores, decoder: decoder)
+        self.regions = LenientDecoding.nilPadding(Region.self, Price.self, in: container, forKey: .regions, decoder: decoder)
+        self.stock = LenientDecoding.nilPadding(Int.self, Int.self, in: container, forKey: .stock, decoder: decoder)
+    }
+}
+
+private func decode<T: Decodable>(_ type: T.Type, _ json: String) throws -> T {
+    try JSONDecoder().decode(T.self, from: Data(json.utf8))
 }

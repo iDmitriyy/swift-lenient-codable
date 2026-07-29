@@ -10,7 +10,7 @@ import Foundation
 /// The runtime engine behind the `@LenientDecodable` macro.
 ///
 /// Every lenient property in a `@LenientDecodable` struct decodes through one
-/// of the four static helpers on this type — the macro-generated
+/// of the static helpers on this type — the macro-generated
 /// `init(from:)` contains one call per property, chosen from the property's
 /// declared shape and annotation:
 ///
@@ -20,6 +20,7 @@ import Foundation
 /// | `[T?]` | `@NilOnFailure` (or implicit) | ``nilPadding(_:in:forKey:decoder:)`` |
 /// | `[T?]?` | `@NilOnFailure` (or implicit) | ``nilPaddingOptional(_:in:forKey:decoder:)`` |
 /// | `[T]` | `@DropOnFailure` | ``dropOnFailure(_:in:forKey:decoder:)`` |
+/// | `[K: V?]` | `@NilOnFailure` (or implicit) | ``nilPadding(_:_:in:forKey:decoder:)`` |
 ///
 /// - Note: `@Strict` properties bypass this type entirely — they decode with
 ///   the normal synthesized behavior (`decode` for non-optionals,
@@ -60,6 +61,9 @@ import Foundation
 /// - ``nilPadding(_:in:forKey:decoder:)``
 /// - ``nilPaddingOptional(_:in:forKey:decoder:)``
 /// - ``dropOnFailure(_:in:forKey:decoder:)``
+///
+/// ### Entry-level leniency
+/// - ``nilPadding(_:_:in:forKey:decoder:)``
 public enum LenientDecoding {
     /// Whole-value leniency: any failure decodes as `nil`.
     ///
@@ -292,6 +296,94 @@ public enum LenientDecoding {
             }
         }
 
+        return result
+    }
+
+    // MARK: Dictionary leniency
+
+    /// Entry padding: entries whose value fails become `nil` at their key,
+    /// entries whose key fails are dropped.
+    ///
+    /// Backs `@NilOnFailure` (explicit or implicit) on a `[K: V?]` property.
+    ///
+    /// | Input | Result | Reported |
+    /// |-------|--------|----------|
+    /// | all entries decode | full dictionary | — |
+    /// | missing key | `[:]` | yes ("key not found") |
+    /// | JSON `null` | `[:]` | no (intentional null) |
+    /// | value is not an object | `[:]` | yes |
+    /// | entry key fails `K.init?(lenientKeyString:)` | entry dropped | yes, with the JSON key |
+    /// | `null` entry value | `nil` at that key | no (intentional null) |
+    /// | malformed entry value | `nil` at that key | yes, with the JSON key |
+    ///
+    /// JSON object keys are always strings on the wire, so each one converts
+    /// to `K` through ``LenientDictionaryKey/init(lenientKeyString:)`` — a
+    /// failed conversion is the *key-level* leniency hook (entry dropped),
+    /// while a failed value decode is the *value-level* one (`nil` padded in).
+    /// When two distinct JSON keys convert to the same `K`, one entry survives
+    /// (which one is unspecified) and the collision is reported.
+    ///
+    /// - Parameters:
+    ///   - keyType: The dictionary key type `K` to convert JSON keys to.
+    ///   - valueType: The value type `V` to decode.
+    ///   - container: The keyed container to read from.
+    ///   - key: The key holding the object.
+    ///   - decoder: The decoder for the value being initialized. Accepted for
+    ///     call-site uniformity of macro-generated code; currently unused.
+    /// - Returns: The decoded entries with `nil` at every key whose value
+    ///   failed, or `[:]` when there is no usable object at `key`.
+    public static func nilPadding<K: LenientDictionaryKey, V: Decodable, Key: CodingKey>(
+        _ keyType: K.Type,
+        _ valueType: V.Type,
+        in container: KeyedDecodingContainer<Key>,
+        forKey key: Key,
+        decoder: any Decoder
+    ) -> [K: V?] {
+        let path = LenientErrorLogger.path(of: container, key: key)
+        guard container.contains(key) else {
+            LenientErrorLogger.log("decoded [:] for '\(path)' — key not found")
+            return [:]
+        }
+        if (try? container.decodeNil(forKey: key)) == true { return [:] }
+        guard let nested = try? container.nestedContainer(keyedBy: AnyCodingKey.self, forKey: key) else {
+            LenientErrorLogger.log("decoded [:] for '\(path)' — value is not an object that can be converted to [:]")
+            return [:]
+        }
+
+        return decodeNilPaddedValues(K.self, V.self, from: nested, path: path)
+    }
+
+    // MARK: Shared entry loop
+    private static func decodeNilPaddedValues<K: LenientDictionaryKey, V: Decodable>(
+        _ keyType: K.Type,
+        _ valueType: V.Type,
+        from nested: KeyedDecodingContainer<AnyCodingKey>,
+        path: String
+    ) -> [K: V?] {
+        var result: [K: V?] = [:]
+        for jsonKey in nested.allKeys {
+            guard let entryKey = K(lenientKeyString: jsonKey.stringValue) else {
+                LenientErrorLogger.log("dropped entry \"\(jsonKey.stringValue)\" of '\(path)' — key is not a valid \(K.self)")
+                continue
+            }
+
+            if result.keys.contains(entryKey) {
+                LenientErrorLogger.log("dropped entry \"\(jsonKey.stringValue)\" of '\(path)' — key collides with an already-decoded entry after conversion")
+                continue
+            }
+
+            if (try? nested.decodeNil(forKey: jsonKey)) == true {
+                result.updateValue(nil, forKey: entryKey)
+                continue
+            }
+
+            do {
+                result.updateValue(try nested.decode(V.self, forKey: jsonKey), forKey: entryKey)
+            } catch {
+                LenientErrorLogger.log("padded nil for entry \"\(jsonKey.stringValue)\" of '\(path)' — \(error)")
+                result.updateValue(nil, forKey: entryKey)
+            }
+        }
         return result
     }
 }

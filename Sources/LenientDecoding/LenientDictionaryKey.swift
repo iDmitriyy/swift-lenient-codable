@@ -18,6 +18,10 @@
 /// leniency hook: the helpers drop that entry and report it, keeping the rest
 /// of the dictionary.
 ///
+/// The conversion need not be injective — distinct JSON keys (`"7"`, `"07"`,
+/// `"+7"`) may convert to the same key; when that happens the helpers keep
+/// one entry (which one is unspecified) and report the collision.
+///
 /// `String` and `Int` conform out of the box. `RawRepresentable` types with
 /// `String` or `Int` raw values get the implementation for free — an enum key
 /// opts in with one line:
