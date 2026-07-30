@@ -215,7 +215,10 @@ private extension LenientDecodableMacro {
    /// The full matrix, including which plan or diagnostic each cell
    /// produces, is documented on `DecodingPlan`. Longhand types
    /// (`Optional<T>`, `Array<T>`, `Dictionary<K, V>`) short-circuit to
-   /// `sugarSyntaxRequired` before any strategy is considered.
+   /// `sugarSyntaxRequired` before any strategy is considered. The lenient
+   /// strategies also reject optional dictionary keys (`[K?: V]`) via
+   /// `diagnoseOptionalDictionaryKey` before entering their shape switch;
+   /// `@Strict` is exempt and decodes whatever the key type is.
    ///
    /// Diagnostics anchor at the property's annotation when one was written,
    /// else at the type annotation — an implicit-strategy error should point
@@ -274,6 +277,11 @@ private extension LenientDecodableMacro {
                }
 
            case .nilOnFailure(let implicit):
+               if diagnoseOptionalDictionaryKey(shape: shape, anchor: anchor, sourceBinding: sourceBinding, in: context) {
+                   hadError = true
+                   continue
+               }
+
                switch shape {
                case .optional(let wrapped):
                    properties[index].plan = .nilOnFailureValue(wrapped: wrapped)
@@ -315,33 +323,50 @@ private extension LenientDecodableMacro {
                        ].compactMap { $0 }))
                    hadError = true
 
-               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
-               case .dictionary, .dictionaryOfOptionalValues:
+               case .dictionaryOfOptionalValues(let key, let value):
+                   properties[index].plan = .dictionaryValuePadding(key: key, value: value)
+
+               case .optionalDictionaryOfOptionalValues(let key, let value):
+                   properties[index].plan = .dictionaryValuePaddingOptional(key: key, value: value)
+
+               case .dictionary(let key, let value):
                    context.diagnose(Diagnostic(
                        node: anchor,
-                       message: LenientDiagnostic.requiresOptional(implicit: implicit),
+                       message: LenientDiagnostic.dictionaryRequiresOptionalValues(implicit: implicit),
                        fixIts: [
-                           LenientFixItHelperMethods.makeOptional(sourceBinding),
+                           LenientFixItHelperMethods.makeValuesOptional(sourceBinding, key: key, value: value),
+                           annotationFixIt("DropOnFailure", annotationNode: annotationNode, sourceDecl: sourceDecl),
                            annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl),
                        ].compactMap { $0 }))
                    hadError = true
 
-               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
                case .optionalDictionary(let key, let value):
-                   properties[index].plan = .nilOnFailureValue(wrapped: TypeSyntax(DictionaryTypeSyntax(key: key, colon: .colonToken(trailingTrivia: .space), value: value)))
-
-               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
-               case .optionalDictionaryOfOptionalValues(let key, let value):
-                   properties[index].plan = .nilOnFailureValue(wrapped: TypeSyntax(DictionaryTypeSyntax(key: key, colon: .colonToken(trailingTrivia: .space), value: TypeSyntax(OptionalTypeSyntax(wrappedType: value)))))
+                   context.diagnose(Diagnostic(
+                       node: anchor,
+                       message: LenientDiagnostic.dictionaryRequiresOptionalValues(implicit: implicit),
+                       fixIts: [
+                           LenientFixItHelperMethods.makeValuesOptionalKeepingOuter(sourceBinding, key: key, value: value),
+                           annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl),
+                       ].compactMap { $0 }))
+                   hadError = true
 
                case .unsupportedLonghand:
                    break // handled above
                }
 
            case .dropOnFailure:
+               if diagnoseOptionalDictionaryKey(shape: shape, anchor: anchor, sourceBinding: sourceBinding, in: context) {
+                   hadError = true
+                   continue
+               }
+
                switch shape {
                case .array(let element):
                    properties[index].plan = .dropOnFailure(element: element)
+
+               case .dictionary(let key, let value):
+                   properties[index].plan = .dictionaryDropOnFailure(key: key, value: value)
+
                case .plain, .optional:
                    context.diagnose(Diagnostic(
                        node: anchor,
@@ -349,14 +374,26 @@ private extension LenientDecodableMacro {
                        fixIts: [annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl)].compactMap { $0 }))
                    hadError = true
 
-               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
-               case .dictionary, .dictionaryOfOptionalValues, .optionalDictionary, .optionalDictionaryOfOptionalValues:
+               case .dictionaryOfOptionalValues(let key, let value):
                    context.diagnose(Diagnostic(
                        node: anchor,
-                       message: LenientDiagnostic.dropRequiresArrayOrDictionary,
-                       fixIts: [annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl)].compactMap { $0 }))
+                       message: LenientDiagnostic.dropRequiresNonOptionalValues,
+                       fixIts: [
+                           LenientFixItHelperMethods.makePlainDictionary(sourceBinding, key: key, value: value),
+                           annotationFixIt("NilOnFailure", annotationNode: annotationNode, sourceDecl: sourceDecl),
+                       ].compactMap { $0 }))
                    hadError = true
-                   
+
+               case .optionalDictionary(let key, let value), .optionalDictionaryOfOptionalValues(let key, let value):
+                   context.diagnose(Diagnostic(
+                       node: anchor,
+                       message: LenientDiagnostic.dropRequiresNonOptionalArrayOrDictionary,
+                       fixIts: [
+                           LenientFixItHelperMethods.makePlainDictionary(sourceBinding, key: key, value: value),
+                           annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl),
+                       ].compactMap { $0 }))
+                   hadError = true
+
                case .optionalArray(let element), .optionalArrayOfOptionals(let element):
                    context.diagnose(Diagnostic(
                        node: anchor,
@@ -453,6 +490,40 @@ private extension LenientDecodableMacro {
            """
        )
    }
+
+    /// Diagnoses `optionalDictionaryKey` when the shape is a dictionary whose
+    /// key type is written optional (`[K?: V]`, any value/outer optionality).
+    ///
+    /// Called at the top of both *lenient* strategy branches, before the
+    /// shape switch — an optional key invalidates every dictionary shape the
+    /// same way, and the key error should not be buried under a value-shape
+    /// diagnostic for the same property. `@Strict` never calls this: it
+    /// decodes with synthesized behavior, whatever the key type.
+    ///
+    /// - Returns: `true` if the diagnostic was emitted; the caller records
+    ///   the error and skips the property.
+    static func diagnoseOptionalDictionaryKey(
+        shape: TypeShape,
+        anchor: Syntax,
+        sourceBinding: PatternBindingSyntax,
+        in context: some MacroExpansionContext
+    ) -> Bool {
+        switch shape {
+        case .dictionary(let key, _),
+             .dictionaryOfOptionalValues(let key, _),
+             .optionalDictionary(let key, _),
+             .optionalDictionaryOfOptionalValues(let key, _):
+            guard key.is(OptionalTypeSyntax.self) else { return false }
+            context.diagnose(Diagnostic(
+                node: anchor,
+                message: LenientDiagnostic.optionalDictionaryKey,
+                fixIts: [LenientFixItHelperMethods.makeKeyNonOptional(sourceBinding)].compactMap { $0 }))
+            return true
+
+        default:
+            return false
+        }
+    }
 
     /// Builds the "switch strategy" fix-it for a shape error, picking the
     /// right edit for the annotation's provenance: an explicit annotation is

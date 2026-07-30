@@ -188,6 +188,516 @@ final class DictionaryStrictExpansionTests: XCTestCase {
             macros: testMacros
         )
     }
+
+    /// Pins the `@Strict` exemption from the optional-key guard: a lenient
+    /// strategy rejects `[K?: V]`, but `@Strict` decodes it with synthesized
+    /// behavior — no diagnostic, plain `decode`.
+    func testStrictOnOptionalKeyDictionaryExpandsWithoutDiagnostic() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Cache {
+                @Strict var counts: [String?: Int]
+            }
+            """,
+            expandedSource: """
+            struct Cache {
+                var counts: [String?: Int]
+
+                private enum CodingKeys: String, CodingKey {
+                    case counts
+                }
+
+                init(from decoder: any Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        self.counts = try container.decode([String?: Int].self, forKey: .counts)
+                }
+            }
+
+            extension Cache: Decodable {
+            }
+            """,
+            macros: testMacros
+        )
+    }
+}
+
+// MARK: - Lenient dictionary expansion (valid matrix cells)
+final class DictionaryLenientExpansionTests: XCTestCase {
+    override func invokeTest() {
+        #if canImport(LenientCodableMacros)
+        super.invokeTest()
+        #endif
+    }
+
+    func testImplicitNilOnFailureOnDictionaryOfOptionalValuesUsesNilPadding() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                var scores: [String: Int?]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int?]
+
+                private enum CodingKeys: String, CodingKey {
+                    case scores
+                }
+
+                init(from decoder: any Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        // implicit @NilOnFailure (applied by @LenientDecodable)
+                        self.scores = LenientDecoding.nilPadding(String.self, Int.self, in: container, forKey: .scores, decoder: decoder)
+                }
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            macros: testMacros
+        )
+    }
+
+    func testExplicitNilOnFailureOnDictionaryOfOptionalValuesOmitsProvenanceComment() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @NilOnFailure var scores: [String: Int?]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int?]
+
+                private enum CodingKeys: String, CodingKey {
+                    case scores
+                }
+
+                init(from decoder: any Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        self.scores = LenientDecoding.nilPadding(String.self, Int.self, in: container, forKey: .scores, decoder: decoder)
+                }
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            macros: testMacros
+        )
+    }
+
+    func testNilOnFailureOnOptionalDictionaryOfOptionalValuesUsesNilPaddingOptional() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @NilOnFailure var extras: [String: Int?]?
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var extras: [String: Int?]?
+
+                private enum CodingKeys: String, CodingKey {
+                    case extras
+                }
+
+                init(from decoder: any Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        self.extras = LenientDecoding.nilPaddingOptional(String.self, Int.self, in: container, forKey: .extras, decoder: decoder)
+                }
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            macros: testMacros
+        )
+    }
+
+    func testDropOnFailureOnPlainDictionaryUsesDropOnFailure() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @DropOnFailure var prices: [String: Double]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var prices: [String: Double]
+
+                private enum CodingKeys: String, CodingKey {
+                    case prices
+                }
+
+                init(from decoder: any Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        self.prices = LenientDecoding.dropOnFailure(String.self, Double.self, in: container, forKey: .prices, decoder: decoder)
+                }
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            macros: testMacros
+        )
+    }
+
+    func testMixedDictionaryAndNonDictionaryPropertiesKeepDeclarationOrder() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @Strict var id: Int
+                var scores: [String: Int?]
+                @DropOnFailure var prices: [String: Double]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var id: Int
+                var scores: [String: Int?]
+                var prices: [String: Double]
+
+                private enum CodingKeys: String, CodingKey {
+                    case id
+                    case scores
+                    case prices
+                }
+
+                init(from decoder: any Decoder) throws {
+                        let container = try decoder.container(keyedBy: CodingKeys.self)
+                        self.id = try container.decode(Int.self, forKey: .id)
+                        // implicit @NilOnFailure (applied by @LenientDecodable)
+                        self.scores = LenientDecoding.nilPadding(String.self, Int.self, in: container, forKey: .scores, decoder: decoder)
+                        self.prices = LenientDecoding.dropOnFailure(String.self, Double.self, in: container, forKey: .prices, decoder: decoder)
+                }
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            macros: testMacros
+        )
+    }
+}
+
+// MARK: - Lenient dictionary diagnostics (invalid matrix cells)
+final class DictionaryDiagnosticTests: XCTestCase {
+    override func invokeTest() {
+        #if canImport(LenientCodableMacros)
+        super.invokeTest()
+        #endif
+    }
+
+    func testImplicitNilOnFailureOnPlainDictionaryRequiresOptionalValues() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                var scores: [String: Int]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int]
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "'@NilOnFailure' (applied by @LenientDecodable) on a dictionary requires optional values — values that fail to decode become 'nil' at their key",
+                    line: 3,
+                    column: 17,
+                    fixIts: [
+                        FixItSpec(message: "change '[String: Int]' to '[String: Int?]'"),
+                        FixItSpec(message: "add '@DropOnFailure'"),
+                        FixItSpec(message: "add '@Strict'"),
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testExplicitNilOnFailureOnPlainDictionaryRequiresOptionalValues() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @NilOnFailure var scores: [String: Int]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int]
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "'@NilOnFailure' on a dictionary requires optional values — values that fail to decode become 'nil' at their key",
+                    line: 3,
+                    column: 5,
+                    fixIts: [
+                        FixItSpec(message: "change '[String: Int]' to '[String: Int?]'"),
+                        FixItSpec(message: "replace with '@DropOnFailure'"),
+                        FixItSpec(message: "replace with '@Strict'"),
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testExplicitNilOnFailureOnOptionalDictionaryRequiresOptionalValues() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @NilOnFailure var scores: [String: Int]?
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int]?
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "'@NilOnFailure' on a dictionary requires optional values — values that fail to decode become 'nil' at their key",
+                    line: 3,
+                    column: 5,
+                    fixIts: [
+                        FixItSpec(message: "change '[String: Int]?' to '[String: Int?]?'"),
+                        FixItSpec(message: "replace with '@Strict'"),
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testDropOnFailureOnDictionaryOfOptionalValuesIsRejected() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @DropOnFailure var scores: [String: Int?]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int?]
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "'@DropOnFailure' requires non-optional values — use '@NilOnFailure' to keep null placeholders",
+                    line: 3,
+                    column: 5,
+                    fixIts: [
+                        FixItSpec(message: "change '[String: Int?]' to '[String: Int]'"),
+                        FixItSpec(message: "replace with '@NilOnFailure'"),
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testDropOnFailureOnOptionalDictionaryIsRejected() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @DropOnFailure var scores: [String: Int]?
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int]?
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "'@DropOnFailure' requires a non-optional array or dictionary — a missing or null key already decodes as '[]' / '[:]'",
+                    line: 3,
+                    column: 5,
+                    fixIts: [
+                        FixItSpec(message: "change '[String: Int]?' to '[String: Int]'"),
+                        FixItSpec(message: "replace with '@Strict'"),
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testDropOnFailureOnOptionalDictionaryOfOptionalValuesIsRejected() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @DropOnFailure var scores: [String: Int?]?
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String: Int?]?
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "'@DropOnFailure' requires a non-optional array or dictionary — a missing or null key already decodes as '[]' / '[:]'",
+                    line: 3,
+                    column: 5,
+                    fixIts: [
+                        FixItSpec(message: "change '[String: Int?]?' to '[String: Int]'"),
+                        FixItSpec(message: "replace with '@Strict'"),
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testImplicitNilOnFailureOnOptionalKeyDictionaryIsRejected() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                var scores: [String?: Int?]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String?: Int?]
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "dictionary keys cannot be optional — an entry whose key fails to decode is dropped",
+                    line: 3,
+                    column: 17,
+                    fixIts: [
+                        FixItSpec(message: "change '[String?: Int?]' to '[String: Int?]'")
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testDropOnFailureOnOptionalKeyDictionaryIsRejected() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @DropOnFailure var scores: [String?: Int]
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String?: Int]
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "dictionary keys cannot be optional — an entry whose key fails to decode is dropped",
+                    line: 3,
+                    column: 5,
+                    fixIts: [
+                        FixItSpec(message: "change '[String?: Int]' to '[String: Int]'")
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testOptionalKeyWinsOverOuterOptionalUnderDropOnFailure() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                @DropOnFailure var scores: [String?: Int]?
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: [String?: Int]?
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "dictionary keys cannot be optional — an entry whose key fails to decode is dropped",
+                    line: 3,
+                    column: 5,
+                    fixIts: [
+                        FixItSpec(message: "change '[String?: Int]?' to '[String: Int]?'")
+                    ]
+                )
+            ],
+            macros: testMacros
+        )
+    }
+
+    func testLonghandDictionaryIsRejected() {
+        assertMacroExpansion(
+            """
+            @LenientDecodable
+            struct Order {
+                var scores: Dictionary<String, Int>
+            }
+            """,
+            expandedSource: """
+            struct Order {
+                var scores: Dictionary<String, Int>
+            }
+
+            extension Order: Decodable {
+            }
+            """,
+            diagnostics: [
+                DiagnosticSpec(
+                    message: "LenientCodable requires sugar syntax ('T?', '[T]') to determine leniency shape",
+                    line: 3,
+                    column: 17
+                )
+            ],
+            macros: testMacros
+        )
+    }
 }
 
 @Suite("Dictionary fix-it factories")
