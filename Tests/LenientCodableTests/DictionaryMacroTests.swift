@@ -112,6 +112,39 @@ struct DictionaryTypeShapeTests {
     }
 }
 
+@Suite("Dictionary DecodingPlan rendering")
+struct DictionaryDecodingPlanTests {
+    @Test("dictionaryValuePadding renders the dictionary nilPadding call")
+    func valuePadding() {
+        let plan = DecodingPlan.dictionaryValuePadding(key: "String", value: "Int")
+        #expect(plan.decodingLine(name: "scores") ==
+            "self.scores = LenientDecoding.nilPadding(String.self, Int.self, in: container, forKey: .scores, decoder: decoder)")
+    }
+
+    @Test("dictionaryValuePaddingOptional renders the dictionary nilPaddingOptional call")
+    func valuePaddingOptional() {
+        let plan = DecodingPlan.dictionaryValuePaddingOptional(key: "String", value: "Int")
+        #expect(plan.decodingLine(name: "extras") ==
+            "self.extras = LenientDecoding.nilPaddingOptional(String.self, Int.self, in: container, forKey: .extras, decoder: decoder)")
+    }
+
+    @Test("dictionaryDropOnFailure renders the dictionary dropOnFailure call")
+    func drop() {
+        let plan = DecodingPlan.dictionaryDropOnFailure(key: "String", value: "Double")
+        #expect(plan.decodingLine(name: "prices") ==
+            "self.prices = LenientDecoding.dropOnFailure(String.self, Double.self, in: container, forKey: .prices, decoder: decoder)")
+    }
+
+    @Test("payload trivia is trimmed in the rendered line")
+    func triviaTrimmed() {
+        let key: TypeSyntax = " String "
+        let value: TypeSyntax = " Int "
+        let plan = DecodingPlan.dictionaryValuePadding(key: key, value: value)
+        #expect(plan.decodingLine(name: "scores") ==
+            "self.scores = LenientDecoding.nilPadding(String.self, Int.self, in: container, forKey: .scores, decoder: decoder)")
+    }
+}
+
 // MARK: - @Strict dictionary expansion (final behavior, not a passthrough)
 final class DictionaryStrictExpansionTests: XCTestCase {
     override func invokeTest() {
