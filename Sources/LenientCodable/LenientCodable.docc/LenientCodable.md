@@ -18,7 +18,7 @@ struct LendingApplicationResponse {
 }
 ```
 
-Every stored property without an annotation is implicitly ``NilOnFailure()``, which requires the type to have a nil-shaped hole for the failure to land in — `T?`, `[T?]`, or `[T?]?`. Any other shape is a compile error with fix-its, so **nothing is silently strict and nothing is silently lenient**: every property's failure behavior is readable at its declaration, and the compiler enforces that the accounting is complete.
+Every stored property without an annotation is implicitly ``NilOnFailure()``, which requires the type to have a nil-shaped hole for the failure to land in — `T?`, `[T?]`, `[T?]?`, `[K: V?]`, or `[K: V?]?`. Any other shape is a compile error with fix-its, so **nothing is silently strict and nothing is silently lenient**: every property's failure behavior is readable at its declaration, and the compiler enforces that the accounting is complete.
 
 The one-sentence philosophy: **lenient about values, strict about structure — and you pick per property whether "strict" means throw.**
 
@@ -26,9 +26,11 @@ The one-sentence philosophy: **lenient about values, strict about structure — 
 
 | Annotation | Applies to | On failure | Can fail the decode? |
 |---|---|---|---|
-| *(none)* / ``NilOnFailure()`` | `T?`, `[T?]`, `[T?]?` | `nil` exactly where it broke | never |
-| ``DropOnFailure()`` | `[T]` | element removed, order kept | never |
+| *(none)* / ``NilOnFailure()`` | `T?`, `[T?]`, `[T?]?`, `[K: V?]`, `[K: V?]?` | `nil` exactly where it broke | never |
+| ``DropOnFailure()`` | `[T]`, `[K: V]` | element/entry removed | never |
 | ``Strict()`` | any type | throws | **yes — the only way** |
+
+Dictionary keys convert from JSON object keys through `LenientDictionaryKey` (`String` and `Int` conform out of the box; a `RawRepresentable` enum opts in with one line). A key that fails to convert always drops its entry — a key has no nil-shaped hole to pad.
 
 ### Observability
 

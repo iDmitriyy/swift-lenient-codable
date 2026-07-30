@@ -24,14 +24,21 @@ import Foundation
 /// | `.nilOnFailure` | ❌ | ``nilOnFailureValue(wrapped:)`` | ❌ | ``nilPadding(element:)`` | ❌ | ``nilPaddingOptionalArray(element:)`` |
 /// | `.dropOnFailure` | ❌ | ❌ | ``dropOnFailure(element:)`` | ❌ | ❌ | ❌ |
 ///
+/// | | `[K: V]` | `[K: V?]` | `[K: V]?` | `[K: V?]?` |
+/// |---|---|---|---|---|
+/// | `.strict` | ``strictRequired(type:)`` | ``strictRequired(type:)`` | ``strictOptional(wrapped:)`` | ``strictOptional(wrapped:)`` |
+/// | `.nilOnFailure` | ❌ | ``dictionaryValuePadding(key:value:)`` | ❌ | ``dictionaryValuePaddingOptional(key:value:)`` |
+/// | `.dropOnFailure` | ``dictionaryDropOnFailure(key:value:)`` | ❌ | ❌ | ❌ |
+///
 /// Holding a `DecodingPlan` is therefore a proof of validity: by the time
 /// `buildInitFromDecoder` calls ``decodingLine(name:)``, there is nothing
 /// left to check.
 ///
 /// Each case stores the one type the generated line needs to spell — the
 /// whole type for a strict `decode`, the *wrapped* type for
-/// `decodeIfPresent` (which re-adds the optionality itself), or the bare
-/// *element* type for the array helpers (which build the array shape at
+/// `decodeIfPresent` (which re-adds the optionality itself), the bare
+/// *element* type for the array helpers, or the *key* and *value* types for
+/// the dictionary helpers (the helpers build the collection shape at
 /// runtime).
 enum DecodingPlan {
     /// `self.x = try container.decode(T.self, forKey: .x)`
@@ -72,6 +79,23 @@ enum DecodingPlan {
     /// keep their order.
     case dropOnFailure(element: TypeSyntax)
 
+    /// `self.x = LenientDecoding.nilPadding(K.self, V.self, ...)` → `[K: V?]`
+    ///
+    /// `@NilOnFailure` on `[K: V?]` — value padding: a failed value becomes
+    /// `nil` at its key; a failed key drops its entry.
+    case dictionaryValuePadding(key: TypeSyntax, value: TypeSyntax)
+
+    /// `self.x = LenientDecoding.nilPaddingOptional(K.self, V.self, ...)` → `[K: V?]?`
+    ///
+    /// `@NilOnFailure` on `[K: V?]?` — as ``dictionaryValuePadding(key:value:)``,
+    /// but an absent or unusable object decodes as `nil` instead of `[:]`.
+    case dictionaryValuePaddingOptional(key: TypeSyntax, value: TypeSyntax)
+
+    /// `self.x = LenientDecoding.dropOnFailure(K.self, V.self, ...)` → `[K: V]`
+    ///
+    /// `@DropOnFailure` on `[K: V]` — failed entries (key or value) are
+    /// removed, survivors keep their keys.
+    case dictionaryDropOnFailure(key: TypeSyntax, value: TypeSyntax)
 }
 
 // MARK: - DecodingPlan decodingLine
@@ -80,8 +104,8 @@ extension DecodingPlan {
     /// `init(from:)`.
     ///
     /// The stored type is emitted `.trimmed` so surrounding trivia from the
-    /// source declaration can't leak into the generated code. The four
-    /// lenient cases call into the `LenientDecoding` runtime module (which
+    /// source declaration can't leak into the generated code. The lenient
+    /// cases call into the `LenientDecoding` runtime module (which
     /// `LenientCodable` re-exports, so the name resolves wherever the macro
     /// is used); the two strict cases are plain Codable calls — the `try` on
     /// them is what makes `@Strict` properties the only possible failure
@@ -110,6 +134,15 @@ extension DecodingPlan {
 
         case .dropOnFailure(let element):
             return "self.\(name) = LenientDecoding.dropOnFailure(\(element.trimmed).self, in: container, forKey: .\(name), decoder: decoder)"
+
+        case .dictionaryValuePadding(let key, let value):
+            return "self.\(name) = LenientDecoding.nilPadding(\(key.trimmed).self, \(value.trimmed).self, in: container, forKey: .\(name), decoder: decoder)"
+
+        case .dictionaryValuePaddingOptional(let key, let value):
+            return "self.\(name) = LenientDecoding.nilPaddingOptional(\(key.trimmed).self, \(value.trimmed).self, in: container, forKey: .\(name), decoder: decoder)"
+
+        case .dictionaryDropOnFailure(let key, let value):
+            return "self.\(name) = LenientDecoding.dropOnFailure(\(key.trimmed).self, \(value.trimmed).self, in: container, forKey: .\(name), decoder: decoder)"
         }
     }
 }

@@ -37,8 +37,19 @@ import Foundation
 /// | `T?`          | whole-value: any failure decodes as `nil` (reported)  |
 /// | `[T?]`        | element padding: failed elements become `nil` in place|
 /// | `[T?]?`       | as `[T?]`, but an absent/unusable array is `nil`      |
-/// | `T`, `[T]`, `[T]?` | ❌ compile error with fix-its — change the type, |
-/// |               | or opt out with `@Strict`                              |
+/// | `[K: V?]`     | value padding: failed values become `nil` at their key|
+/// | `[K: V?]?`    | as `[K: V?]`, but an absent/unusable object is `nil`  |
+/// | `T`, `[T]`, `[T]?`, `[K: V]`, `[K: V]?` | ❌ compile error with       |
+/// |               | fix-its — change the type, or opt out with `@Strict`   |
+///
+/// Dictionary keys convert from the JSON object's key strings through
+/// `LenientDictionaryKey` (`String` and `Int` conform out of the box; a
+/// `RawRepresentable` enum opts in with
+/// `extension Status: LenientDictionaryKey {}`). A key that fails to convert
+/// always drops its entry, under every lenient strategy — a key has no
+/// nil-shaped hole to pad, and two failed keys would collide at the same
+/// slot. Optional keys (`[K?: V]`) are a compile error under lenient
+/// strategies for the same reason.
 ///
 /// Skipped entirely (never decoded, never diagnosed): static properties,
 /// computed properties, and `let` constants with an initializer. A stored `var`
@@ -69,10 +80,21 @@ public macro LenientDecodable() = #externalMacro(
 ///   "something failed" gate.
 /// - `[T?]?` — as `[T?]`, but an absent or unusable array decodes as `nil`
 ///   instead of `[]`.
+/// - `[K: V?]` — missing key → `[:]` (reported); `null` → `[:]` (silent);
+///   wrong container shape → `[:]` (reported); a `null` entry value → `nil`
+///   at that key (silent); a malformed entry value → `nil` at that key
+///   (reported with the JSON key). Entry *keys* convert from JSON strings
+///   through `LenientDictionaryKey`; a key that fails to convert drops its
+///   whole entry (reported) — a key has no nil-shaped hole, and two failed
+///   keys would collide. Two JSON keys converting to the same `K` keep one
+///   entry (which one is unspecified; reported).
+/// - `[K: V?]?` — as `[K: V?]`, but an absent or unusable object decodes as
+///   `nil` instead of `[:]`.
 ///
-/// Invalid shapes (compile error + fix-its): non-optional `T`, `[T]`, `[T]?`.
-/// The rule: this annotation puts `nil` exactly where the failure happened, so
-/// the type must have a nil-shaped hole at that spot.
+/// Invalid shapes (compile error + fix-its): non-optional `T`, `[T]`, `[T]?`,
+/// `[K: V]`, `[K: V]?`, and optional dictionary keys (`[K?: V]`). The rule:
+/// this annotation puts `nil` exactly where the failure happened, so the type
+/// must have a nil-shaped hole at that spot.
 ///
 /// This is also the behavior `@LenientDecodable` applies implicitly to every
 /// unannotated property — writing it explicitly is documentation, not a change
@@ -84,21 +106,27 @@ public macro NilOnFailure() = #externalMacro(
 )
 
 /// Pretend it wasn't there. Applies to `[T]` (non-optional array, non-optional
-/// elements) only. Never fails the decode.
+/// elements) and `[K: V]` (non-optional dictionary, non-optional values) only.
+/// Never fails the decode.
 ///
-/// - Missing key → `[]` (reported).
-/// - JSON `null` → `[]` (silent, intentional null).
-/// - Wrong container shape → `[]` (reported).
-/// - A failed element — for any reason: unknown case inside it, missing
+/// - Missing key → `[]` / `[:]` (reported).
+/// - JSON `null` → `[]` / `[:]` (silent, intentional null).
+/// - Wrong container shape → `[]` / `[:]` (reported).
+/// - A failed array element — for any reason: unknown case inside it, missing
 ///   required field, `null`, wrong shape — → removed from the result (reported
 ///   with its index). Surviving elements keep their original order.
+/// - A failed dictionary entry — a value that fails to decode (including
+///   `null`, since a non-optional `V` has nowhere to keep it), or a key that
+///   fails `LenientDictionaryKey` conversion — → removed from the result
+///   (reported with the JSON key). Two JSON keys converting to the same `K`
+///   keep one entry (which one is unspecified; reported).
 ///
-/// The result is a clean non-optional `[T]` with zero `nil` handling at call
-/// sites — at the cost of erasing all in-value evidence that elements were
-/// dropped (the evidence lives only in the error report). Element dropping is
-/// a product decision: it is never applied by defaulting and must always be
-/// written explicitly. Prefer `@NilOnFailure` on `[T?]` for lists that
-/// represent obligations or completeness.
+/// The result is a clean non-optional `[T]` / `[K: V]` with zero `nil`
+/// handling at call sites — at the cost of erasing all in-value evidence that
+/// entries were dropped (the evidence lives only in the error report).
+/// Dropping is a product decision: it is never applied by defaulting and must
+/// always be written explicitly. Prefer `@NilOnFailure` on `[T?]` / `[K: V?]`
+/// for collections that represent obligations or completeness.
 @attached(peer)
 public macro DropOnFailure() = #externalMacro(
     module: "LenientCodableMacros",

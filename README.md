@@ -25,6 +25,7 @@ let response = try JSONDecoder().decode(ApplicationResponse.self, from: data)
 - [How It Works](#how-it-works)
 - [What the Macro Writes](#what-the-macro-writes)
 - [The Annotations](#the-annotations)
+- [Dictionaries](#dictionaries)
 - [Compile-Time Enforcement](#compile-time-enforcement)
 - [Debug Logging](#debug-logging)
 - [Rules & Edge Cases](#rules--edge-cases)
@@ -57,7 +58,9 @@ Then add `LenientCodable` to your target's dependencies and `import LenientCodab
 | `T?` | whole value → `nil` |
 | `[T?]` | failed element → `nil` **in place**, count preserved |
 | `[T?]?` | as `[T?]`; an absent or unusable array → `nil` instead of `[]` |
-| `T`, `[T]`, `[T]?` | ❌ compile error with fix-its — change the type, or opt out with `@Strict` |
+| `[K: V?]` | failed value → `nil` **at its key**; failed key → entry dropped |
+| `[K: V?]?` | as `[K: V?]`; an absent or unusable object → `nil` instead of `[:]` |
+| `T`, `[T]`, `[T]?`, `[K: V]`, `[K: V]?` | ❌ compile error with fix-its — change the type, or opt out with `@Strict` |
 
 That last row is the design's core guarantee: **nothing is silently strict and nothing is silently lenient.** Every property's failure behavior is readable at its declaration — lenient by visible type shape, or explicit by visible annotation — and the compiler enforces that the accounting is complete.
 
@@ -98,8 +101,8 @@ Three things to notice: `@Strict` properties compile to plain `try container.dec
 
 | Annotation | Applies to | On failure | Can fail the decode? |
 |---|---|---|---|
-| *(none)* / `@NilOnFailure` | `T?`, `[T?]`, `[T?]?` | `nil` exactly where it broke | never |
-| `@DropOnFailure` | `[T]` | element removed, order kept | never |
+| *(none)* / `@NilOnFailure` | `T?`, `[T?]`, `[T?]?`, `[K: V?]`, `[K: V?]?` | `nil` exactly where it broke | never |
+| `@DropOnFailure` | `[T]`, `[K: V]` | element/entry removed | never |
 | `@Strict` | any type | throws | **yes — the only way** |
 
 ### `@NilOnFailure` — nil where it broke
@@ -128,6 +131,74 @@ In a `@LenientDecodable` struct, `@Strict` properties are the *only* way a decod
 
 > ⚠️ On an enum property, synthesized decoding throws for an *unknown raw value* — meaning a new backend enum case will fail the decode. Use `@Strict` on enums from evolving APIs deliberately.
 
+## Dictionaries
+
+The same annotations extend to dictionaries, with one twist: an entry has **two** failure points — the key and the value — and they get different treatment.
+
+**A failed key always drops its entry**, under every lenient strategy. That's forced by dictionary semantics, not policy: a key has no nil-shaped hole to pad `nil` into, and two failed keys would collide at the same slot. **A failed value follows the annotation**, exactly like an array element: `@NilOnFailure` pads `nil` at that key, `@DropOnFailure` removes the pair.
+
+| Annotation | Shape | Failed value | Failed key |
+|---|---|---|---|
+| *(none)* / `@NilOnFailure` | `[K: V?]` | `nil` at that key | entry dropped |
+| *(none)* / `@NilOnFailure` | `[K: V?]?` | as `[K: V?]`; an absent/unusable object → `nil` | entry dropped |
+| `@DropOnFailure` | `[K: V]` | entry dropped (`null` too — non-optional `V` has nowhere to keep it) | entry dropped |
+| `@Strict` | any dictionary | throws | throws |
+
+Whole-value failures mirror arrays exactly: missing key → `[:]` (reported), JSON `null` → `[:]` (silent), value isn't an object → `[:]` (reported) — and the outer-optional shape (`[K: V?]?`) decodes `nil` instead of `[:]` in all three cases. Optional keys (`[K?: V]`) are a compile error under lenient strategies, fix-it removes the `?`.
+
+### Keys: `LenientDictionaryKey`
+
+JSON object keys are always strings on the wire, and Codable never exposes a decoder positioned on a key — so lenient dictionary decoding needs an explicit string → key contract:
+
+```swift
+public protocol LenientDictionaryKey: Hashable {
+    init?(lenientKeyString: String)
+}
+```
+
+`String` and `Int` conform out of the box, and `RawRepresentable` types with `String` or `Int` raw values get the implementation for free — an enum key opts in with one line:
+
+```swift
+enum Subject: String, Codable { case math, science }
+extension Subject: LenientDictionaryKey {}
+```
+
+Any custom key joins the same way. Returning `nil` is not an error path — it *is* the key-level leniency hook: that entry is dropped and reported, and the rest of the dictionary survives.
+
+```swift
+extension UUID: LenientDictionaryKey {
+    public init?(lenientKeyString: String) {
+        self.init(uuidString: lenientKeyString)
+    }
+}
+```
+
+The conversion doesn't have to be injective: when two JSON keys convert to the same key (`"7"` and `"07"` as `Int`), one entry survives — which one is unspecified — and the collision is reported.
+
+`LenientDictionaryKey` is a decode-only, failure-tolerant analogue of the standard library's `CodingKeyRepresentable`, back-deployed to this package's iOS 13 floor (`CodingKeyRepresentable` requires iOS 15.4).
+
+### One payload, both failure points
+
+```swift
+@LenientDecodable
+struct ReportCard {
+    var scores: [Subject: Int?]   // implicitly @NilOnFailure
+}
+```
+
+```json
+{ "scores": { "math": 91, "science": "N/A", "alchemy": 60 } }
+```
+
+```swift
+let card = try JSONDecoder().decode(ReportCard.self, from: json)
+card.scores   // [.math: 91, .science: nil]
+// "N/A" isn't an Int      → value failure → nil padded at .science (reported)
+// "alchemy" isn't a Subject → key failure  → entry dropped          (reported)
+```
+
+One broken value and one unknown key, and the decode still hands you everything usable — under plain `Codable`, that payload would have thrown.
+
 ## Compile-Time Enforcement
 
 The macro validates every property's type shape against its strategy and refuses to generate against an invalid spec. Errors arrive with fix-its enumerating your actual choices:
@@ -148,7 +219,7 @@ struct Response {
 }
 ```
 
-Also diagnosed: conflicting annotations on one property, `@DropOnFailure` on non-arrays / optional arrays / optional elements, longhand spellings (`Optional<T>`, `Array<T>` — use sugar syntax), stored properties without a written type (macros can't see inferred types), a hand-written `init(from:)`, duplicate application, and applying the macro to anything but a struct. A redundant `: Decodable` on the struct is a warning.
+Also diagnosed: conflicting annotations on one property, `@DropOnFailure` anywhere but a plain `[T]` / `[K: V]`, optional dictionary keys (`[K?: V]`), longhand spellings (`Optional<T>`, `Array<T>`, `Dictionary<K, V>` — use sugar syntax), stored properties without a written type (macros can't see inferred types), a hand-written `init(from:)`, duplicate application, and applying the macro to anything but a struct. A redundant `: Decodable` on the struct is a warning.
 
 ## Debug Logging
 
@@ -159,6 +230,8 @@ decoded nil for 'status' — dataCorrupted(...)
 decoded nil for 'status' — key not found
 padded nil at element 2 of 'documents' — typeMismatch(...)
 dropped element 1 of 'offers' — keyNotFound(...)
+padded nil for entry "science" of 'scores' — typeMismatch(...)
+dropped entry "alchemy" of 'scores' — key is not a valid Subject
 ```
 
 Missing keys are reported (the backend omitting a field is worth knowing about); an explicit JSON `null` is the one silent case. Filter the firehose in Console.app or from the terminal:
@@ -176,7 +249,7 @@ Release builds compile the logging out entirely — messages are never even cons
 - **Your `CodingKeys` wins.** Declare your own enum (or typealias) named `CodingKeys` for custom key mappings and the macro references it instead of generating one.
 - **Explicit types required.** `var x = 0` is an error: macros see syntax, not inferred types.
 - **Sugar syntax required.** `T?` and `[T]`, not `Optional<T>` / `Array<T>`.
-- **Nesting composes.** For element-level control *inside* an element type, make that type `@LenientDecodable` too and annotate its properties — leniency at the value level protects the element level.
+- **Leniency depth is one level.** Array elements and dictionary values are decoded as whole values — in `[String: [Int]]`, one bad `Int` fails that whole entry. For control *inside* an element or value type, make that type `@LenientDecodable` too and annotate its properties — leniency composes by nesting.
 
 ## When NOT to Use This
 
