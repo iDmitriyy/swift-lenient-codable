@@ -189,6 +189,68 @@ struct DictionaryDecodingTests {
             #expect(extras["b"]! == nil)
         }
     }
+
+    @Suite("LenientDecoding.dropOnFailure (dictionary)")
+    struct DictionaryDropOnFailureTests {
+        private func json(prices: String) -> String {
+            #"{ "scores": {}, "regions": {}, "stock": {}, "prices": \#(prices) }"#
+        }
+
+        @Test("all entries valid → full dictionary")
+        func allValid() throws {
+            let catalog = try decode(Catalog.self, json(prices: #"{ "eu": 9.99, "us": 12.5 }"#))
+            #expect(catalog.prices == ["eu": 9.99, "us": 12.5])
+        }
+
+        @Test("broken value → entry dropped, survivors intact")
+        func brokenValueDropped() throws {
+            let catalog = try decode(Catalog.self, json(prices: #"{ "eu": 9.99, "us": "n/a" }"#))
+            #expect(catalog.prices == ["eu": 9.99])
+        }
+
+        @Test("null value → entry dropped (reported, unlike padding)")
+        func nullValueDropped() throws {
+            let catalog = try decode(Catalog.self, json(prices: #"{ "eu": 9.99, "us": null }"#))
+            #expect(catalog.prices == ["eu": 9.99])
+        }
+
+        @Test("missing key → [:]")
+        func missingKey() throws {
+            let catalog = try decode(Catalog.self, #"{ "scores": {}, "regions": {}, "stock": {} }"#)
+            #expect(catalog.prices == [:])
+        }
+
+        @Test("JSON null → [:]")
+        func nullDictionary() throws {
+            let catalog = try decode(Catalog.self, json(prices: "null"))
+            #expect(catalog.prices == [:])
+        }
+
+        @Test("value is not an object → [:]")
+        func notAnObject() throws {
+            let catalog = try decode(Catalog.self, json(prices: #""free""#))
+            #expect(catalog.prices == [:])
+        }
+
+        @Test("keys colliding after conversion keep exactly one entry")
+        func keyCollision() throws {
+            let inventory = try decode(Inventory.self, #"{ "counts": { "7": 1, "07": 2 } }"#)
+            #expect(inventory.counts.count == 1)
+            #expect(inventory.counts[7] != nil)
+        }
+
+        @Test("a failed entry does not reserve its key — a colliding duplicate can fill it")
+        func failedEntryDoesNotReserveKey() throws {
+            let inventory = try decode(Inventory.self, #"{ "counts": { "7": "bad", "07": 2 } }"#)
+            #expect(inventory.counts == [7: 2])
+        }
+
+        @Test("non-numeric Int key → entry dropped")
+        func badIntKey() throws {
+            let inventory = try decode(Inventory.self, #"{ "counts": { "7": 100, "abc": 5 } }"#)
+            #expect(inventory.counts == [7: 100])
+        }
+    }
 }
 
 // MARK: - Helper types
@@ -205,8 +267,9 @@ private struct Catalog: Decodable {
     let regions: [Region: Price?]
     let stock: [Int: Int?]
     let extras: [String: Int?]?
+    let prices: [String: Double]
 
-    enum CodingKeys: CodingKey { case scores, regions, stock, extras }
+    enum CodingKeys: CodingKey { case scores, regions, stock, extras, prices }
 
     init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -214,6 +277,21 @@ private struct Catalog: Decodable {
         self.regions = LenientDecoding.nilPadding(Region.self, Price.self, in: container, forKey: .regions, decoder: decoder)
         self.stock = LenientDecoding.nilPadding(Int.self, Int.self, in: container, forKey: .stock, decoder: decoder)
         self.extras = LenientDecoding.nilPaddingOptional(String.self, Int.self, in: container, forKey: .extras, decoder: decoder)
+        self.prices = LenientDecoding.dropOnFailure(String.self, Double.self, in: container, forKey: .prices, decoder: decoder)
+    }
+}
+
+/// Exercises the dictionary `dropOnFailure` helper with an `Int` key, whose
+/// conversion can fail — unlike `String` — so key-drop and key-collision
+/// behavior are reachable.
+private struct Inventory: Decodable {
+    let counts: [Int: Int]
+
+    enum CodingKeys: CodingKey { case counts }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.counts = LenientDecoding.dropOnFailure(Int.self, Int.self, in: container, forKey: .counts, decoder: decoder)
     }
 }
 

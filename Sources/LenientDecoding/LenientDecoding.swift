@@ -22,6 +22,7 @@ import Foundation
 /// | `[T]` | `@DropOnFailure` | ``dropOnFailure(_:in:forKey:decoder:)`` |
 /// | `[K: V?]` | `@NilOnFailure` (or implicit) | ``nilPadding(_:_:in:forKey:decoder:)`` |
 /// | `[K: V?]?` | `@NilOnFailure` (or implicit) | ``nilPaddingOptional(_:_:in:forKey:decoder:)`` |
+/// | `[K: V]` | `@DropOnFailure` | ``dropOnFailure(_:_:in:forKey:decoder:)`` |
 ///
 /// - Note: `@Strict` properties bypass this type entirely — they decode with
 ///   the normal synthesized behavior (`decode` for non-optionals,
@@ -66,6 +67,7 @@ import Foundation
 /// ### Entry-level leniency
 /// - ``nilPadding(_:_:in:forKey:decoder:)``
 /// - ``nilPaddingOptional(_:_:in:forKey:decoder:)``
+/// - ``dropOnFailure(_:_:in:forKey:decoder:)``
 public enum LenientDecoding {
     /// Whole-value leniency: any failure decodes as `nil`.
     ///
@@ -399,6 +401,83 @@ public enum LenientDecoding {
             return nil
         }
         return decodeNilPaddedValues(K.self, V.self, from: nested, path: path)
+    }
+
+    /// Entry dropping: failed entries are removed — bad key, bad value, or
+    /// `null` value — survivors keep their keys.
+    ///
+    /// Backs `@DropOnFailure` on a `[K: V]` property.
+    ///
+    /// | Input | Result | Reported |
+    /// |-------|--------|----------|
+    /// | all entries decode | full dictionary | — |
+    /// | missing key | `[:]` | yes ("key not found") |
+    /// | JSON `null` | `[:]` | no (intentional null) |
+    /// | value is not an object | `[:]` | yes |
+    /// | failed entry — bad key, bad value, or a `null` value | removed | yes, with the JSON key |
+    /// | keys colliding after conversion | one entry survives (which one is unspecified) | yes, with the JSON key |
+    ///
+    /// Unlike entry padding, a `null` entry value is dropped *and reported* —
+    /// a non-optional `V` has no `nil`-shaped hole to keep it in. A colliding
+    /// key only blocks later duplicates once an entry has actually decoded;
+    /// a failed entry does not reserve its key, so a colliding duplicate can
+    /// still fill it.
+    ///
+    /// The result is a clean non-optional `[K: V]` with zero `nil` handling
+    /// at call sites — at the cost of erasing all in-value evidence that
+    /// entries were dropped. Unlike ``nilPadding(_:_:in:forKey:decoder:)``,
+    /// the returned count tells you nothing; the evidence lives only in the
+    /// error report. Prefer nil padding for dictionaries that represent
+    /// obligations or completeness.
+    ///
+    /// - Parameters:
+    ///   - keyType: The dictionary key type `K` to convert JSON keys to.
+    ///   - valueType: The value type `V` to decode.
+    ///   - container: The keyed container to read from.
+    ///   - key: The key holding the object.
+    ///   - decoder: The decoder for the value being initialized. Accepted for
+    ///     call-site uniformity of macro-generated code; currently unused.
+    /// - Returns: The entries that decoded cleanly, or `[:]` when there is no
+    ///   usable object at `key`.
+    public static func dropOnFailure<K: LenientDictionaryKey, V: Decodable, Key: CodingKey>(
+        _ keyType: K.Type,
+        _ valueType: V.Type,
+        in container: KeyedDecodingContainer<Key>,
+        forKey key: Key,
+        decoder: any Decoder
+    ) -> [K: V] {
+        let path = LenientErrorLogger.path(of: container, key: key)
+        guard container.contains(key) else {
+            LenientErrorLogger.log("decoded [:] for '\(path)' — key not found")
+            return [:]
+        }
+        if (try? container.decodeNil(forKey: key)) == true { return [:] }
+        guard let nested = try? container.nestedContainer(keyedBy: AnyCodingKey.self, forKey: key) else {
+            LenientErrorLogger.log("decoded [:] for '\(path)' — value is not an object that can be converted to [:]")
+            return [:]
+        }
+
+        // Decoding the object to [:]
+        var result: [K: V] = [:]
+        for jsonKey in nested.allKeys {
+            guard let entryKey = K(lenientKeyString: jsonKey.stringValue) else {
+                LenientErrorLogger.log("dropped entry \"\(jsonKey.stringValue)\" of '\(path)' — key is not a valid \(K.self)")
+                continue
+            }
+
+            if result.keys.contains(entryKey) {
+                LenientErrorLogger.log("dropped entry \"\(jsonKey.stringValue)\" of '\(path)' — key collides with an already-decoded entry after conversion")
+                continue
+            }
+
+            do {
+                result[entryKey] = try nested.decode(V.self, forKey: jsonKey)
+            } catch {
+                LenientErrorLogger.log("dropped entry \"\(jsonKey.stringValue)\" of '\(path)' — \(error)")
+            }
+        }
+
+        return result
     }
 
     // MARK: Shared entry loop
