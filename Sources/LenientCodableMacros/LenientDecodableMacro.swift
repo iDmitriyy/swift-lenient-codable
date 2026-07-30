@@ -214,8 +214,8 @@ private extension LenientDecodableMacro {
    ///
    /// The full matrix, including which plan or diagnostic each cell
    /// produces, is documented on `DecodingPlan`. Longhand types
-   /// (`Optional<T>`, `Array<T>`) short-circuit to `sugarSyntaxRequired`
-   /// before any strategy is considered.
+   /// (`Optional<T>`, `Array<T>`, `Dictionary<K, V>`) short-circuit to
+   /// `sugarSyntaxRequired` before any strategy is considered.
    ///
    /// Diagnostics anchor at the property's annotation when one was written,
    /// else at the type annotation — an implicit-strategy error should point
@@ -259,10 +259,20 @@ private extension LenientDecodableMacro {
                    
                case .plain, .array, .arrayOfOptionals:
                    properties[index].plan = .strictRequired(type: properties[index].type)
+
+               case .dictionary, .dictionaryOfOptionalValues:
+                   properties[index].plan = .strictRequired(type: properties[index].type)
+
+               case .optionalDictionary(let key, let value):
+                   properties[index].plan = .strictOptional(wrapped: TypeSyntax(DictionaryTypeSyntax(key: key, colon: .colonToken(trailingTrivia: .space), value: value)))
+
+               case .optionalDictionaryOfOptionalValues(let key, let value):
+                   properties[index].plan = .strictOptional(wrapped: TypeSyntax(DictionaryTypeSyntax(key: key, colon: .colonToken(trailingTrivia: .space), value: TypeSyntax(OptionalTypeSyntax(wrappedType: value)))))
+
                case .unsupportedLonghand:
                    break // handled above
                }
-               
+
            case .nilOnFailure(let implicit):
                switch shape {
                case .optional(let wrapped):
@@ -304,16 +314,43 @@ private extension LenientDecodableMacro {
                            annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl),
                        ].compactMap { $0 }))
                    hadError = true
-                   
+
+               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
+               case .dictionary, .dictionaryOfOptionalValues:
+                   context.diagnose(Diagnostic(
+                       node: anchor,
+                       message: LenientDiagnostic.requiresOptional(implicit: implicit),
+                       fixIts: [
+                           LenientFixItHelperMethods.makeOptional(sourceBinding),
+                           annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl),
+                       ].compactMap { $0 }))
+                   hadError = true
+
+               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
+               case .optionalDictionary(let key, let value):
+                   properties[index].plan = .nilOnFailureValue(wrapped: TypeSyntax(DictionaryTypeSyntax(key: key, colon: .colonToken(trailingTrivia: .space), value: value)))
+
+               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
+               case .optionalDictionaryOfOptionalValues(let key, let value):
+                   properties[index].plan = .nilOnFailureValue(wrapped: TypeSyntax(DictionaryTypeSyntax(key: key, colon: .colonToken(trailingTrivia: .space), value: TypeSyntax(OptionalTypeSyntax(wrappedType: value)))))
+
                case .unsupportedLonghand:
                    break // handled above
                }
-               
+
            case .dropOnFailure:
                switch shape {
                case .array(let element):
                    properties[index].plan = .dropOnFailure(element: element)
                case .plain, .optional:
+                   context.diagnose(Diagnostic(
+                       node: anchor,
+                       message: LenientDiagnostic.dropRequiresArray,
+                       fixIts: [annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl)].compactMap { $0 }))
+                   hadError = true
+
+               // TODO(Task 10): temporary passthrough — dictionaries kept on pre-dictionary behavior until the matrix lands
+               case .dictionary, .dictionaryOfOptionalValues, .optionalDictionary, .optionalDictionaryOfOptionalValues:
                    context.diagnose(Diagnostic(
                        node: anchor,
                        message: LenientDiagnostic.dropRequiresArray,
