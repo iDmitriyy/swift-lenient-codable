@@ -5,6 +5,7 @@
 //  Created by Omar Elsayed on 29/07/2026.
 //
 
+import SwiftDiagnostics
 import SwiftSyntax
 import SwiftSyntaxBuilder
 import SwiftSyntaxMacrosTestSupport
@@ -186,5 +187,66 @@ final class DictionaryStrictExpansionTests: XCTestCase {
             """,
             macros: testMacros
         )
+    }
+}
+
+@Suite("Dictionary fix-it factories")
+struct DictionaryFixItTests {
+    private func binding(_ decl: String) throws -> PatternBindingSyntax {
+        let varDecl = try #require(DeclSyntax(stringLiteral: decl).as(VariableDeclSyntax.self))
+        return try #require(varDecl.bindings.first)
+    }
+
+    private func rewrittenType(of fixIt: FixIt?) throws -> String {
+        let change = try #require(fixIt?.changes.first)
+        guard case .replace(_, let newNode) = change else {
+            Issue.record("expected a replace change"); return ""
+        }
+        return newNode.trimmedDescription
+    }
+
+    @Test("makeValuesOptional: [K: V] → [K: V?]")
+    func valuesOptional() throws {
+        let b = try binding("var x: [String: Int]")
+        let key: TypeSyntax = "String", value: TypeSyntax = "Int"
+        #expect(try rewrittenType(of: LenientFixItHelperMethods.makeValuesOptional(b, key: key, value: value)) == "[String: Int?]")
+    }
+
+    @Test("makeValuesOptionalKeepingOuter: [K: V]? → [K: V?]?")
+    func valuesOptionalKeepingOuter() throws {
+        let b = try binding("var x: [String: Int]?")
+        let key: TypeSyntax = "String", value: TypeSyntax = "Int"
+        #expect(try rewrittenType(of: LenientFixItHelperMethods.makeValuesOptionalKeepingOuter(b, key: key, value: value)) == "[String: Int?]?")
+    }
+
+    @Test("makePlainDictionary: [K: V?]? → [K: V]")
+    func plainDictionary() throws {
+        let b = try binding("var x: [String: Int?]?")
+        let key: TypeSyntax = "String", value: TypeSyntax = "Int"
+        #expect(try rewrittenType(of: LenientFixItHelperMethods.makePlainDictionary(b, key: key, value: value)) == "[String: Int]")
+    }
+
+    @Test("makeKeyNonOptional: [K?: V] → [K: V]")
+    func keyNonOptional() throws {
+        let b = try binding("var x: [String?: Int]")
+        #expect(try rewrittenType(of: LenientFixItHelperMethods.makeKeyNonOptional(b)) == "[String: Int]")
+    }
+
+    @Test("makeKeyNonOptional preserves outer optional and value spelling: [K?: V?]? → [K: V?]?")
+    func keyNonOptionalPreservesRest() throws {
+        let b = try binding("var x: [String?: Int?]?")
+        #expect(try rewrittenType(of: LenientFixItHelperMethods.makeKeyNonOptional(b)) == "[String: Int?]?")
+    }
+
+    @Test("makeKeyNonOptional returns nil when the key is already non-optional — never a no-op fix-it")
+    func keyNonOptionalRefusesNoOp() throws {
+        let b = try binding("var x: [String: Int]")
+        #expect(LenientFixItHelperMethods.makeKeyNonOptional(b) == nil)
+    }
+
+    @Test("makeKeyNonOptional returns nil for a non-dictionary type")
+    func keyNonOptionalRefusesNonDictionary() throws {
+        let b = try binding("var x: Int")
+        #expect(LenientFixItHelperMethods.makeKeyNonOptional(b) == nil)
     }
 }

@@ -345,7 +345,7 @@ private extension LenientDecodableMacro {
                case .plain, .optional:
                    context.diagnose(Diagnostic(
                        node: anchor,
-                       message: LenientDiagnostic.dropRequiresArray,
+                       message: LenientDiagnostic.dropRequiresArrayOrDictionary,
                        fixIts: [annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl)].compactMap { $0 }))
                    hadError = true
 
@@ -353,14 +353,14 @@ private extension LenientDecodableMacro {
                case .dictionary, .dictionaryOfOptionalValues, .optionalDictionary, .optionalDictionaryOfOptionalValues:
                    context.diagnose(Diagnostic(
                        node: anchor,
-                       message: LenientDiagnostic.dropRequiresArray,
+                       message: LenientDiagnostic.dropRequiresArrayOrDictionary,
                        fixIts: [annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl)].compactMap { $0 }))
                    hadError = true
                    
                case .optionalArray(let element), .optionalArrayOfOptionals(let element):
                    context.diagnose(Diagnostic(
                        node: anchor,
-                       message: LenientDiagnostic.dropRequiresNonOptionalArray,
+                       message: LenientDiagnostic.dropRequiresNonOptionalArrayOrDictionary,
                        fixIts: [
                            LenientFixItHelperMethods.makePlainArray(sourceBinding, element: element),
                            annotationFixIt("Strict", annotationNode: annotationNode, sourceDecl: sourceDecl),

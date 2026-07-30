@@ -82,19 +82,41 @@ enum LenientDiagnostic: DiagnosticMessage {
     /// with `@Strict`. Same `implicit` wording rule as ``requiresOptional(implicit:)``.
     case arrayRequiresOptionalElements(implicit: Bool)
 
-    /// `@DropOnFailure` on something that isn't an array at all (`T` or `T?`)
-    /// — there are no elements to drop. Fix-it: replace with `@Strict`.
-    case dropRequiresArray
+    /// `@DropOnFailure` on something that is neither an array nor a
+    /// dictionary (`T` or `T?`) — there is nothing to drop. Fix-it: replace
+    /// with `@Strict`.
+    case dropRequiresArrayOrDictionary
 
-    /// `@DropOnFailure` on `[T]?` or `[T?]?` — the outer optional is dead
-    /// weight because a missing or `null` key already decodes as `[]`.
-    /// Fix-its: make it a plain `[T]`, or replace with `@Strict`.
-    case dropRequiresNonOptionalArray
+    /// `@DropOnFailure` on `[T]?` / `[T?]?` or `[K: V]?` / `[K: V?]?` — the
+    /// outer optional is dead weight because a missing or `null` key already
+    /// decodes as the empty collection (`[]` / `[:]`). Fix-its: make it a
+    /// plain `[T]` (or `[K: V]`), or replace with `@Strict`.
+    case dropRequiresNonOptionalArrayOrDictionary
 
     /// `@DropOnFailure` on `[T?]` — dropping and nil-padding are mutually
     /// exclusive answers to the same failure. Fix-its: make it a plain `[T]`,
     /// or replace with `@NilOnFailure` to keep the `nil` placeholders.
     case dropRequiresNonOptionalElements
+
+    /// `@NilOnFailure` semantics on `[K: V]` or `[K: V]?` — value padding
+    /// writes `nil` at the failed value's key, so the value type must be
+    /// optional. Fix-its: make the values optional (`[K: V]` → `[K: V?]`,
+    /// keeping an outer optional if present), switch to `@DropOnFailure`
+    /// (plain `[K: V]` only), or opt out with `@Strict`. Same `implicit`
+    /// wording rule as ``requiresOptional(implicit:)``.
+    case dictionaryRequiresOptionalValues(implicit: Bool)
+
+    /// `@DropOnFailure` on `[K: V?]` — dropping and nil-padding are mutually
+    /// exclusive answers to the same failure. Fix-its: make it a plain
+    /// `[K: V]`, or switch to `@NilOnFailure` to keep the `nil` placeholders.
+    case dropRequiresNonOptionalValues
+
+    /// A lenient strategy on a dictionary whose key type is optional
+    /// (`[K?: V]`) — an entry whose key fails to decode is dropped, so an
+    /// optional key has no meaning (and colliding `nil` keys would overwrite
+    /// each other). Fix-it: make the key non-optional. `@Strict` is exempt:
+    /// it decodes with synthesized behavior, whatever the key type.
+    case optionalDictionaryKey
 
     /// The property's type is written longhand (`Optional<T>`, `Array<T>`,
     /// possibly module-qualified) — the macro classifies shapes purely
@@ -138,14 +160,23 @@ enum LenientDiagnostic: DiagnosticMessage {
         case .arrayRequiresOptionalElements(let implicit):
             return "'@NilOnFailure'\(implicit ? " (applied by @LenientDecodable)" : "") on an array requires optional elements — elements that fail to decode become 'nil' in place"
 
-        case .dropRequiresArray:
-            return "'@DropOnFailure' can only be applied to an array property"
+        case .dropRequiresArrayOrDictionary:
+            return "'@DropOnFailure' can only be applied to an array or dictionary property"
 
-        case .dropRequiresNonOptionalArray:
-            return "'@DropOnFailure' requires a non-optional array — a missing or null key already decodes as '[]'"
+        case .dropRequiresNonOptionalArrayOrDictionary:
+            return "'@DropOnFailure' requires a non-optional array or dictionary — a missing or null key already decodes as '[]' / '[:]'"
 
         case .dropRequiresNonOptionalElements:
             return "'@DropOnFailure' requires non-optional elements — use '@NilOnFailure' to keep null placeholders"
+
+        case .dictionaryRequiresOptionalValues(let implicit):
+            return "'@NilOnFailure'\(implicit ? " (applied by @LenientDecodable)" : "") on a dictionary requires optional values — values that fail to decode become 'nil' at their key"
+
+        case .dropRequiresNonOptionalValues:
+            return "'@DropOnFailure' requires non-optional values — use '@NilOnFailure' to keep null placeholders"
+
+        case .optionalDictionaryKey:
+            return "dictionary keys cannot be optional — an entry whose key fails to decode is dropped"
 
         case .sugarSyntaxRequired:
             return "LenientCodable requires sugar syntax ('T?', '[T]') to determine leniency shape"

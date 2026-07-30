@@ -848,7 +848,7 @@ final class LenientDecodableDiagnosticTests: XCTestCase {
             """,
             diagnostics: [
                 DiagnosticSpec(
-                    message: "'@DropOnFailure' can only be applied to an array property",
+                    message: "'@DropOnFailure' can only be applied to an array or dictionary property",
                     line: 3,
                     column: 5,
                     fixIts: [FixItSpec(message: "replace with '@Strict'")]
@@ -876,7 +876,7 @@ final class LenientDecodableDiagnosticTests: XCTestCase {
             """,
             diagnostics: [
                 DiagnosticSpec(
-                    message: "'@DropOnFailure' requires a non-optional array — a missing or null key already decodes as '[]'",
+                    message: "'@DropOnFailure' requires a non-optional array or dictionary — a missing or null key already decodes as '[]' / '[:]'",
                     line: 3,
                     column: 5,
                     fixIts: [
