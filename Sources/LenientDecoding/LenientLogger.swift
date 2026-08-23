@@ -94,13 +94,30 @@ enum LenientErrorLogger {
 //===-------------------------------------------------------------------------------------------------------------------===//
 
 /// The handler type for receiving lenient decoding log entries.
-/// Injected once globally; can be overridden per-decoder via `userInfo`.
+///
+/// Injected once globally via ``inject_once(lenientDecodingLogger:rateLimits:...)``;
+/// can be overridden per-decoder via ``JSONDecoder.setLenientDecodingLogger(_:)``.
+///
+/// **Behavior:**
+/// - If a global logger is injected, it receives **all** lenient decoding failures
+///   in both DEBUG and RELEASE builds.
+/// - If no global logger is injected, DEBUG builds additionally log via `os.Logger` (iOS 14+,
+///   macOS 11+, etc.) or `print` fallback. RELEASE builds are silent.
+/// - Per-decoder loggers (set via `JSONDecoder.setLenientDecodingLogger(_:)`)
+///   take precedence over the global logger for that decoder.
 public typealias LenientDecodingLogger = @Sendable (LenientDecodingLogEntry) -> Void
 
 // MARK: - Inject Logger Once
 
 /// Injects the global log handler. Can only be called once.
 /// Subsequent calls will log a warning via the existing handler.
+///
+/// The injected logger receives **all** lenient decoding failures in both
+/// DEBUG and RELEASE builds. Without injection, DEBUG builds use the
+/// internal `os.Logger`/`print` fallback and RELEASE builds are silent.
+/// Per-decoder loggers (via `JSONDecoder.setLenientDecodingLogger(_:)`)
+/// override the global logger for that decoder.
+///
 /// - Parameters:
 ///   - logger: The log handler to receive all lenient decoding errors.
 ///   - rateLimits: Optional custom rate limits. On macOS 15+/iOS 18+ these are
