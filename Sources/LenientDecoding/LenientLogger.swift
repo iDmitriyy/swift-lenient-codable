@@ -123,7 +123,7 @@ public func inject_once(lenientDecodingLogger logger: @escaping LenientDecodingL
           _rateLimits = rateLimits
         } // else {} // on older OS versions rate limit is constant and can not be overriden
 
-        // Drain buffered entries and set forwarding atomically.
+        // Drain buffered entries and set forwarding single atomic transaction.
         // Stale references of `pendingEntriesLogger` after the drain route new entries
         // directly to `injected logger` instead of being silently lost.
         let pendingEntries = pendingEntriesLogger.extractPendingEntriesAndForwardNew(toInjectedLogger: logger)
@@ -133,7 +133,7 @@ public func inject_once(lenientDecodingLogger logger: @escaping LenientDecodingL
         return (nil, pendingEntries)
       }
     }
-  
+
   for entry in pendingEntries {
     logger(entry)
   }
@@ -253,10 +253,10 @@ package var globalLogger: LenientDecodingLogger {
 /// existing entries are annotated with a `"pendingBufferOverflow"` key
 /// in their `info` dictionary to signal that some more entries were dropped.
 fileprivate final class PendingEntriesLogger: Sendable {
-  private let _pendingEntriesLimit: UInt8 = _rateLimits.totalDecodingLimit
+  private let _pendingEntriesLimit: UInt8 = 5
 
   private typealias State =
-  (pendingEntries: [LenientDecodingLogEntry], injectedLogger: LenientDecodingLogger?, isOverflowLogged: Bool)
+    (pendingEntries: [LenientDecodingLogEntry], injectedLogger: LenientDecodingLogger?, isOverflowLogged: Bool)
   private let _state = NSLock_<State>((pendingEntries: [], injectedLogger: nil, isOverflowLogged: false))
 
   /// Atomically drains buffered entries and installs the injected logger.
@@ -285,13 +285,13 @@ fileprivate final class PendingEntriesLogger: Sendable {
         if state.isOverflowLogged {
           return
         }
-        
+
         let message = "pending buffer overflow: some decoding warnings were dropped because the global "
           + "logger was not injected yet"
         for i in state.pendingEntries.indices {
           state.pendingEntries[i].annotatePendingBufferOverflow(message: message)
         }
-        
+
         _globalDebugLogger(logEntry)
         state.isOverflowLogged = true
         return
@@ -398,7 +398,7 @@ fileprivate var _rateLimits: (totalDecodingLimit: UInt8, dropElementsPerArrayLim
 /// lower = `totalDecodingLimit`, upper = `dropElementsPerArrayLimit`.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 fileprivate let __bitpackedRateLimits = Atomic<UInt16>(.bitpackRateLimits(totalDecodingLimit: 3,
-                                                                           dropElementsPerArrayLimit: 3))
+                                                                          dropElementsPerArrayLimit: 3))
 extension UInt16 {
   /// Packs two `UInt8` rate limits into a single `UInt16`.
   ///
@@ -414,6 +414,8 @@ extension UInt16 {
 //===-------------------------------------------------------------------------------------------------------------------===//
 
 // MARK: - Logging DataModels
+
+// MARK: LogEntry
 
 /// Accumulates all warnings for a single decoded object.
 ///
@@ -453,6 +455,7 @@ public struct LenientDecodingLogEntry: Sendable {
   /// Maximum number of unique warnings stored per decoded object.
   /// Captured from ``_rateLimits`` at initialization.
   private let totalDecodingWarningsLimit: UInt8
+  
   /// Maximum number of per-element warnings stored per array.
   /// Captured from ``_rateLimits`` at initialization.
   private let dropElementsPerArrayWarningLimit: UInt8
@@ -527,7 +530,7 @@ public struct LenientDecodingLogEntry: Sendable {
   }
 
   // MARK: Synthetic warning for internal logging
-  
+
   /// Creates a synthetic entry containing a single internal warning.
   ///
   /// Used by ``inject_once`` and ``Decoder.lenientDecodingLogger`` to report
@@ -557,7 +560,7 @@ public struct LenientDecodingLogEntry: Sendable {
       for index in propertyDecodingWarnings.indices {
         propertyDecodingWarnings.values[index].info[messageKey] = message
       }
-    } else if !dropOnFailureWarnings.isEmpty {      
+    } else if !dropOnFailureWarnings.isEmpty {
       for index in dropOnFailureWarnings.indices where !dropOnFailureWarnings.values[index].warnings.isEmpty {
         dropOnFailureWarnings.values[index].warnings[0].info[messageKey] = message
       }
@@ -597,6 +600,8 @@ fileprivate func errorIdentity(prefix: String, path: String) -> String {
   prefix + ":" + path
 }
 
+// MARK: Decoding Warning
+
 /// A single structured warning for a lenient decoding failure.
 /// Contains all context needed for debugging and monitoring.
 ///
@@ -616,22 +621,55 @@ public struct LenientDecodingWarning: Sendable {
 
   /// Numeric category of the failure (see ``LenientDecodingErrorCode``).
   public let code: LenientDecodingErrorCode
+  
   /// Dot-joined coding path from the JSON root to the failing value.
   public let path: String
-  /// The lenient strategy annotation (e.g. `"@NilOnFailure"`, `"@DropOnFailure"`).
-  public let strategy: String
+  
   /// The underlying error from the `DecodingError.Context`, if available.
   /// This is the error that caused the decoding failure (e.g. a date parsing error
   /// that triggered a `typeMismatch`), not the `DecodingError` itself.
   public let underlyingError: (any Error)?
-  /// Additional metadata.
+  /// Additional metadata. Includes `"strategy"` (e.g. `"@NilOnFailure"`).
   ///
   /// Examples:
   /// - `"contextDebugDescription"` — the `DecodingError.Context.debugDescription`.
   /// - `"expectedType"` — the type that was expected (for `typeMismatch`/`valueNotFound`).
   /// - `"missingKey"` — the absent key (for `keyNotFound`).
   public fileprivate(set) var info: [String: any Sendable & CustomStringConvertible]
+
+  /// Creates a warning, automatically storing `strategy` in `info["strategy"]`.
+  fileprivate init(errorIdentity: String,
+                   code: LenientDecodingErrorCode,
+                   path: String,
+                   strategy: String,
+                   underlyingError: (any Error)?,
+                   info: consuming [String: any Sendable & CustomStringConvertible]) {
+    info["code"] = "\(code)"
+    info["path"] = path
+    info["strategy"] = strategy
+    if let underlyingError {
+      let descriptions = [
+        ("underlyingErrorDebugDescription", String(reflecting: underlyingError)),
+        ("underlyingErrorLocalizedDescription", underlyingError.localizedDescription),
+        ("underlyingErrorDescription", String(describing: underlyingError)),
+      ]
+      var added = Set<String>()
+      for (name, description) in descriptions {
+        if !added.contains(description) {
+          info[name] = description
+          added.insert(description)
+        }
+      }
+    }
+    self.errorIdentity = errorIdentity
+    self.code = code
+    self.path = path
+    self.underlyingError = underlyingError
+    self.info = info
+  }
 }
+
+// MARK: DecodingError as Warning
 
 extension DecodingError {
   /// Converts a `DecodingError` into a structured ``LenientDecodingWarning``.
@@ -694,6 +732,8 @@ extension DecodingError.Context {
     codingPath.map { $0.stringValue }.joined(separator: ".")
   }
 }
+
+// MARK: Error Code
 
 /// Internal error codes for categorizing lenient decoding failures.
 /// These are stable identifiers used for filtering and aggregation.
@@ -768,7 +808,7 @@ private final class NSLock_<Value: ~Copyable>: @unchecked Sendable {
   init(_ value: consuming Value) {
     self.value = value
   }
-  
+
   public func withLock<Result: ~Copyable>(_ body: (inout sending Value) -> sending Result)
     -> sending Result {
     lock.lock(); defer { lock.unlock() }
