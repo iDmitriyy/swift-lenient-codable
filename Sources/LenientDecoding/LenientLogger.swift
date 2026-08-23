@@ -103,6 +103,10 @@ public typealias LenientDecodingLogger = @Sendable (LenientDecodingLogEntry) -> 
 /// Subsequent calls will log a warning via the existing handler.
 /// - Parameters:
 ///   - logger: The log handler to receive all lenient decoding errors.
+///   - rateLimits: Optional custom rate limits. On macOS 15+/iOS 18+ these are
+///     stored atomically and respected by every `LenientDecodingLogEntry` created
+///     afterwards. On older OS versions the default `(3, 3)` is used and this
+///     parameter is ignored.
 ///   - file: Source file (for assertion).
 ///   - line: Source line (for assertion).
 public func inject_once(lenientDecodingLogger logger: @escaping LenientDecodingLogger,
@@ -153,19 +157,31 @@ public func inject_once(lenientDecodingLogger logger: @escaping LenientDecodingL
 // MARK: - Decoder Extension
 
 extension JSONDecoder {
+  /// Attaches a per-decoder log handler.
+  ///
+  /// When set, all lenient decoding failures decoded through this decoder
+  /// are routed to `logger` instead of the global logger. Useful for
+  /// isolating logs per decoder or for testing.
+  ///
+  /// - Parameter logger: The log handler to receive failures from this decoder.
   public func setLenientDecodingLogger(_ logger: @escaping LenientDecodingLogger) {
     userInfo[.lenientDecodingLogHandler] = _DecoderLoggerBox(loggerInstance: logger)
   }
 }
 
 extension Decoder {
-  /// Returns either logger provided via `userInfo` or injected `globalLogger`
-  package var lenientDecodingLogger: LenientDecodingLogger? {
+  /// Returns either logger provided via `userInfo` or injected `globalLogger`.
+  ///
+  /// Checks `userInfo[.lenientDecodingLogHandler]` first. If a valid
+  /// ``_DecoderLoggerBox`` is found its logger is returned. If the box is
+  /// missing or has an invalid type, falls back to ``globalLogger`` and
+  /// logs a warning about the misconfiguration.
+  package var lenientDecodingLogger: LenientDecodingLogger {
     if let value = userInfo[.lenientDecodingLogHandler] {
       if let loggerBox = (value as? _DecoderLoggerBox) {
         return loggerBox.loggerInstance
       } else {
-        let message = "Invalid type of logger provided in Decoder.userInfo. This message was forwarded to global logger."
+        let message = "Invalid logger type in Decoder.userInfo; falling back to global logger."
         let logEntry = LenientDecodingLogEntry.internalsImpWarning(message: message)
 
         let fallbackLogger = globalLogger
@@ -178,7 +194,11 @@ extension Decoder {
   }
 }
 
-/// Used to for storing `LenientDecodingLogger` in `userInfo` as closures can not be stored in `[CodingUserInfoKey: any Sendable] `.
+/// Box used to store `LenientDecodingLogger` in `Decoder.userInfo`.
+///
+/// Closures cannot be stored directly in `[CodingUserInfoKey: any Sendable]`
+/// because they are not `Sendable`-conforming types. This wrapper conforms to
+/// `Sendable` and holds the logger for retrieval by ``Decoder.lenientDecodingLogger``.
 fileprivate struct _DecoderLoggerBox: Sendable {
   let loggerInstance: LenientDecodingLogger
 }
@@ -200,9 +220,14 @@ extension CodingUserInfoKey {
 
 /// Returns the current global logger.
 ///
-/// Stale references to the `.pending` variant are safe: once
-/// `inject_once` calls `extractPendingEntriesAndForwardNew(toInjectedLogger:)`, any `append` on the old
-/// `PendingEntriesLogger` routes directly to the injected logger.
+/// On every call this reads ``_globalLogger`` inside the lock (fast),
+/// then calls the returned logger outside the lock to avoid serializing
+/// concurrent log calls.
+///
+/// Stale references to the `.pending` variant are safe: when ``inject_once``
+/// calls ``extractPendingEntriesAndForwardNew(toInjectedLogger:)``, the old
+/// ``PendingEntriesLogger`` is updated so any subsequent `append` calls on it
+/// route directly to the injected logger.
 package var globalLogger: LenientDecodingLogger {
   { logEntry in
     #if DEBUG
@@ -213,14 +238,32 @@ package var globalLogger: LenientDecodingLogger {
   }
 }
 
+// MARK: PendingEntries Logger
+
+/// Buffers log entries received before the global logger is injected.
+///
+/// Created automatically at library init time and stored inside
+/// ``_GlobalLoggerVariant/pending(_:)``. When ``inject_once`` is called,
+/// it calls ``extractPendingEntriesAndForwardNew(toInjectedLogger:)`` to
+/// atomically drain the buffer and install the injected logger.
+/// After that, all future `append` calls route directly to the injected handler.
+/// The drained entries are also forwarded to the injected logger.
+///
+/// The buffer is capped at ``_pendingEntriesLimit`` entries. When full,
+/// existing entries are annotated with a `"pendingBufferOverflow"` key
+/// in their `info` dictionary to signal that some more entries were dropped.
 fileprivate final class PendingEntriesLogger: Sendable {
   private let _pendingEntriesLimit: UInt8 = _rateLimits.totalDecodingLimit
 
-  private typealias State = (pendingEntries: [LenientDecodingLogEntry], injectedLogger: LenientDecodingLogger?)
-  private let _state = NSLock_<State>((pendingEntries: [], injectedLogger: nil))
+  private typealias State =
+  (pendingEntries: [LenientDecodingLogEntry], injectedLogger: LenientDecodingLogger?, isOverflowLogged: Bool)
+  private let _state = NSLock_<State>((pendingEntries: [], injectedLogger: nil, isOverflowLogged: false))
 
-  /// Atomically drains buffered entries and sets the `injectedLogger` for forwarding further entries .
-  /// After this call, `append` routes new entries directly to `injectedLogger`.
+  /// Atomically drains buffered entries and installs the injected logger.
+  ///
+  /// Returns the buffered entries so the caller (``inject_once``) can forward
+  /// them to the injected logger. After this call, `append` routes new
+  /// entries directly to `injectedLogger`.
   fileprivate func extractPendingEntriesAndForwardNew(toInjectedLogger injectedLogger: @escaping LenientDecodingLogger)
     -> [LenientDecodingLogEntry] {
     _state.withLock { state in
@@ -239,6 +282,10 @@ fileprivate final class PendingEntriesLogger: Sendable {
       }
 
       guard state.pendingEntries.count < _pendingEntriesLimit else {
+        if state.isOverflowLogged {
+          return
+        }
+        
         let message = "pending buffer overflow: some decoding warnings were dropped because the global "
           + "logger was not injected yet"
         for i in state.pendingEntries.indices {
@@ -246,6 +293,7 @@ fileprivate final class PendingEntriesLogger: Sendable {
         }
         
         _globalDebugLogger(logEntry)
+        state.isOverflowLogged = true
         return
       }
 
@@ -282,13 +330,27 @@ fileprivate final class PendingEntriesLogger: Sendable {
 
 // MARK: - Global Logger Config
 
-/// Global log handler storage with thread-safe access.
+/// Thread-safe storage for the current global logger variant.
+///
+/// Starts as `.pending(PendingEntriesLogger())` and transitions to
+/// `.injected(logger)` exactly once, when ``inject_once`` is called.
+/// Every log call through ``globalLogger`` reads the variant inside
+/// this lock.
 fileprivate let _globalLogger = NSLock_(_GlobalLoggerVariant.pending(PendingEntriesLogger()))
 
+/// Represents the two states of the global logger lifecycle.
 fileprivate enum _GlobalLoggerVariant {
+  /// Logger not yet injected. Entries are buffered in the associated
+  /// ``PendingEntriesLogger`` until ``inject_once`` drains and forwards
+  /// them to the injected logger.
   case pending(PendingEntriesLogger)
+  /// Logger injected. Entries are logged by associated handler.
   case injected(LenientDecodingLogger)
 
+  /// Returns a ``LenientDecodingLogger`` closure for the current variant.
+  ///
+  /// For `.pending`, the closure appends to the buffer.
+  /// For `.injected`, the closure forwards directly to the externally injected handler.
   var instance: LenientDecodingLogger {
     switch self {
     case .pending(let pendingEntriesLogger):
@@ -301,6 +363,15 @@ fileprivate enum _GlobalLoggerVariant {
 
 // MARK: Rate Limits
 
+/// Two rate-limit values packed into a single `UInt16` for lock-free atomic access.
+///
+/// - Lower byte: `totalDecodingLimit` – max unique warnings per decoded object.
+/// - Upper byte: `dropElementsPerArrayLimit` – max per-element warnings for array.
+///
+/// On macOS 15+/iOS 18+ the values can be overridden
+/// via ``inject_once(lenientDecodingLogger:rateLimits:...)``.
+/// On older OS versions the getter returns the hardcoded default `(3, 3)`
+/// and the setter does not available.
 fileprivate var _rateLimits: (totalDecodingLimit: UInt8, dropElementsPerArrayLimit: UInt8) {
   get {
     if #available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *) {
@@ -321,10 +392,18 @@ fileprivate var _rateLimits: (totalDecodingLimit: UInt8, dropElementsPerArrayLim
   }
 }
 
+/// Atomic storage for the bitpacked rate limits.
+///
+/// Accessed via ``_rateLimits``. The `UInt16` is split into two bytes:
+/// lower = `totalDecodingLimit`, upper = `dropElementsPerArrayLimit`.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
 fileprivate let __bitpackedRateLimits = Atomic<UInt16>(.bitpackRateLimits(totalDecodingLimit: 3,
-                                                                          dropElementsPerArrayLimit: 3))
+                                                                           dropElementsPerArrayLimit: 3))
 extension UInt16 {
+  /// Packs two `UInt8` rate limits into a single `UInt16`.
+  ///
+  /// - `totalDecodingLimit` occupies the lower byte.
+  /// - `dropElementsPerArrayLimit` occupies the upper byte.
   fileprivate static func bitpackRateLimits(totalDecodingLimit: UInt8, dropElementsPerArrayLimit: UInt8) -> UInt16 {
     let higherByte = UInt16(dropElementsPerArrayLimit) << 8
     let lowerByte = UInt16(totalDecodingLimit)
@@ -336,31 +415,70 @@ extension UInt16 {
 
 // MARK: - Logging DataModels
 
-/// Used during Decoding to accumulate warnings.
+/// Accumulates all warnings for a single decoded object.
+///
+/// One instance is created per decoded object.
+///
+/// Rate limiting is applied at two levels:
+/// - **Per decoded object:** `totalDecodingWarningsLimit` caps the total number
+///   of unique warnings stored. Overflow is tracked in
+///   ``propertyDecodingOverflowedWarnings``.
+/// - **Per array element:** `dropElementsPerArrayWarningLimit` caps the number
+///   of per-element warnings stored under a single array. Overflow is
+///   tracked in the `overflowCount` field of ``dropOnFailureWarnings``.
 public struct LenientDecodingLogEntry: Sendable {
-  /// `[errorIdentity: warning]` pairs
+  /// Warnings keyed by their `errorIdentity` (e.g. `"keyNotFound:path.to.field"`).
+  /// Capped at `totalDecodingWarningsLimit` entries per decoded object.
   public private(set) var propertyDecodingWarnings: [String: LenientDecodingWarning] = [:]
 
-  /// `[arrayPropertyPath: (warnings:, overflowCount:)]` pairs
+  /// Per-array drop-on-failure warnings.
+  ///
+  /// Keyed by `"dropOnFailure:" + arrayPath` (e.g. `"dropOnFailure:orders"`).
+  /// This key is computed locally, not from the warning's `errorIdentity`,
+  /// because the `DecodingError` context includes the element index, making
+  /// each warning's `errorIdentity` unique per element. Using that would
+  /// split warnings across multiple keys; we want them grouped by array.
+  /// Each value contains up to `dropElementsPerArrayWarningLimit` warnings
+  /// and an `overflowCount` for additional dropped elements beyond the limit.
   public private(set) var dropOnFailureWarnings: [String: (warnings: [LenientDecodingWarning], overflowCount: UInt)] = [:]
 
+  /// Error identities for warnings that could not be stored because the total
+  /// per-object rate limit (`totalDecodingWarningsLimit`) was reached.
+  /// This includes both property-level warnings (from `@NilOnFailure`/`@Strict`)
+  /// and drop-on-failure array keys that couldn't create a new entry.
   public private(set) var propertyDecodingOverflowedWarnings: Set<String> = []
 
   // MARK: - Rate Limits
 
+  /// Maximum number of unique warnings stored per decoded object.
+  /// Captured from ``_rateLimits`` at initialization.
   private let totalDecodingWarningsLimit: UInt8
+  /// Maximum number of per-element warnings stored per array.
+  /// Captured from ``_rateLimits`` at initialization.
   private let dropElementsPerArrayWarningLimit: UInt8
 
+  /// `true` when the combined count of `propertyDecodingWarnings` and
+  /// `dropOnFailureWarnings` has reached `totalDecodingWarningsLimit`.
   private var isTotalDecodingRateLimitReached: Bool {
     (propertyDecodingWarnings.count + dropOnFailureWarnings.count) >= totalDecodingWarningsLimit
   }
 
+  /// Creates a new entry, snapshotting the current rate limits from ``_rateLimits``.
   fileprivate init() {
     let rateLimits = _rateLimits
     totalDecodingWarningsLimit = rateLimits.totalDecodingLimit
     dropElementsPerArrayWarningLimit = rateLimits.dropElementsPerArrayLimit
   }
 
+  /// Records a property-level decoding failure.
+  ///
+  /// If the total rate limit has not been reached, the warning is stored in
+  /// ``propertyDecodingWarnings``; otherwise only the `errorIdentity` is
+  /// recorded in ``propertyDecodingOverflowedWarnings``.
+  ///
+  /// - Parameters:
+  ///   - propertyDecodingError: The `DecodingError` absorbed by a `LenientDecoding`.
+  ///   - decodingStrategy: The strategy annotation (e.g. `"@NilOnFailure"`).
   package mutating func append(propertyDecodingError: DecodingError,
                                decodingStrategy: String) {
     let warning = propertyDecodingError.asWarning(decodingStrategy: decodingStrategy)
@@ -371,6 +489,18 @@ public struct LenientDecodingLogEntry: Sendable {
     }
   }
 
+  /// Records a drop-on-failure element error for a specific array key.
+  ///
+  /// The first `dropElementsPerArrayWarningLimit` warnings per array
+  /// are stored in ``dropOnFailureWarnings``; beyond that only an
+  /// `overflowCount` is incremented. If the total rate limit has already been
+  /// reached, the identity is added to ``propertyDecodingOverflowedWarnings``
+  /// instead of creating a new entry.
+  ///
+  /// - Parameters:
+  ///   - dropOnFailureError: The `DecodingError` absorbed for this element.
+  ///   - key: The `CodingKey` of the array property being decoded.
+  ///   - container: The keyed container from which the array was read.
   package mutating func append<Key: CodingKey>(dropOnFailureError: DecodingError,
                                                forArrayKey key: Key,
                                                container: KeyedDecodingContainer<Key>) {
@@ -396,6 +526,13 @@ public struct LenientDecodingLogEntry: Sendable {
     }
   }
 
+  // MARK: Synthetic warning for internal logging
+  
+  /// Creates a synthetic entry containing a single internal warning.
+  ///
+  /// Used by ``inject_once`` and ``Decoder.lenientDecodingLogger`` to report
+  /// infrastructure issues (e.g. double injection, invalid userInfo type)
+  /// without going through the normal decode path.
   fileprivate static func internalsImpWarning(message: String) -> Self {
     var entry = Self()
     let code = LenientDecodingErrorCode.unexpectedCodeEntrance
@@ -409,45 +546,98 @@ public struct LenientDecodingLogEntry: Sendable {
     return entry
   }
 
+  /// Annotates the first warning in this entry with a `"pendingBufferOverflow"` info key.
+  ///
+  /// Called by ``PendingEntriesLogger`` when its buffer is full, signaling that
+  /// some warnings for this decoded object were dropped because the global
+  /// logger had not been injected yet.
   fileprivate mutating func annotatePendingBufferOverflow(message: String) {
-    if let firstKey = propertyDecodingWarnings.keys.first,
-       let index = propertyDecodingWarnings.index(forKey: firstKey) {
-      propertyDecodingWarnings.values[index].info["pendingBufferOverflow"] = message
-    } else if let firstKey = dropOnFailureWarnings.keys.first,
-              let index = dropOnFailureWarnings.index(forKey: firstKey),
-              dropOnFailureWarnings.values[index].warnings.indices.contains(0) {
-      dropOnFailureWarnings.values[index].warnings[0].info["pendingBufferOverflow"] = message
+    let messageKey = "pendingBufferOverflowOccured"
+    if !propertyDecodingWarnings.isEmpty {
+      for index in propertyDecodingWarnings.indices {
+        propertyDecodingWarnings.values[index].info[messageKey] = message
+      }
+    } else if !dropOnFailureWarnings.isEmpty {      
+      for index in dropOnFailureWarnings.indices where !dropOnFailureWarnings.values[index].warnings.isEmpty {
+        dropOnFailureWarnings.values[index].warnings[0].info[messageKey] = message
+      }
     }
   }
 }
 
+/// Renders the full coding path of `key` inside `container` as a
+/// dot-joined string (e.g. `"order.docs"` or `"orders.Index 2.status"`).
+///
+/// This path identifies the location of a value in the JSON structure.
+/// It's used as part of the `errorIdentity` (e.g. `"keyNotFound:order.status"`)
+/// to group and look up warnings in ``LenientDecodingLogEntry/propertyDecodingWarnings``
+/// and ``LenientDecodingLogEntry/dropOnFailureWarnings``.
+///
+/// The container's `codingPath` (the walk from the JSON root to the container)
+/// is extended with `key`, and each component's `stringValue` is joined with `.`.
+/// A key at the top level therefore renders as just `"status"`; if the struct
+/// sits inside a JSON array, the synthesized index key appears in the path
+/// (e.g. `"orders.Index 2.status"`).
+///
+/// - Parameters:
+///   - container: The keyed container the failing value was read from.
+///   - key: The key whose path is being reported.
+/// - Returns: The dot-joined path from the JSON root to `key`.
 package func loggingPath<Key: CodingKey>(ofContainer container: KeyedDecodingContainer<Key>,
                                          key: Key) -> String {
   (container.codingPath + [key]).map { $0.stringValue }.joined(separator: ".")
 }
 
+/// Builds a stable string identity for a warning from a prefix and coding path.
+///
+/// Used as dictionary keys in ``LenientDecodingLogEntry/propertyDecodingWarnings``
+/// and ``LenientDecodingLogEntry/dropOnFailureWarnings``. The format is
+/// `"<prefix>:<path>"` (e.g. `"keyNotFound:order.status"`).
 fileprivate func errorIdentity(prefix: String, path: String) -> String {
   prefix + ":" + path
 }
 
-/// Structured log entry for a lenient decoding failure.
+/// A single structured warning for a lenient decoding failure.
 /// Contains all context needed for debugging and monitoring.
+///
+/// One ``LenientDecodingLogEntry`` (per decoded object) collects multiple
+/// ``LenientDecodingWarning`` values – one for each absorbed failure.
 public struct LenientDecodingWarning: Sendable {
+  /// Stable string used as the dictionary key in ``LenientDecodingLogEntry/propertyDecodingWarnings``.
+  /// Format: `"<errorType>:<codingPath>"` (e.g. `"keyNotFound:order.status"`).
+  ///
+  /// For property-level failures (`@NilOnFailure`, `@Strict`), this is the lookup key.
+  /// For `@DropOnFailure` array elements, the `DecodingError` context includes the
+  /// element index, so each element's `errorIdentity` is unique (e.g.
+  /// `"typeMismatch:orders.Index 0"`). To group all element failures of the same array
+  /// under one dictionary key, `append(dropOnFailureError:...)` computes a separate
+  /// identity: `"dropOnFailure:" + arrayPath` (without element index).
   fileprivate let errorIdentity: String
 
+  /// Numeric category of the failure (see ``LenientDecodingErrorCode``).
   public let code: LenientDecodingErrorCode
+  /// Dot-joined coding path from the JSON root to the failing value.
   public let path: String
-  /// e.g. `@NilOnFailure`, `@DropOnFailure`, `@Strict`...
+  /// The lenient strategy annotation (e.g. `"@NilOnFailure"`, `"@DropOnFailure"`).
   public let strategy: String
+  /// The underlying error from the `DecodingError.Context`, if available.
+  /// This is the error that caused the decoding failure (e.g. a date parsing error
+  /// that triggered a `typeMismatch`), not the `DecodingError` itself.
   public let underlyingError: (any Error)?
+  /// Additional metadata.
+  ///
+  /// Examples:
+  /// - `"contextDebugDescription"` — the `DecodingError.Context.debugDescription`.
+  /// - `"expectedType"` — the type that was expected (for `typeMismatch`/`valueNotFound`).
+  /// - `"missingKey"` — the absent key (for `keyNotFound`).
   public fileprivate(set) var info: [String: any Sendable & CustomStringConvertible]
 }
 
 extension DecodingError {
-  /// Formats a DecodingError into a human-readable description.
+  /// Converts a `DecodingError` into a structured ``LenientDecodingWarning``.
   /// - Parameters:
-  ///   - decodingStrategy: passed  by Macro, e.g. `@NilOnFailure`, `@DropOnFailure`, `@Strict`
-  /// - Returns: LenientDecodingLogEntry
+  ///   - decodingStrategy: The strategy annotation passed by the macro, e.g. `"@NilOnFailure"`, `"@DropOnFailure"`, `"@Strict"`.
+  /// - Returns: A ``LenientDecodingWarning`` populated from the error's type, context, and underlying error.
   fileprivate func asWarning(decodingStrategy: String) -> LenientDecodingWarning {
     let contextDebugDescrKey = "contextDebugDescription"
     switch self {
@@ -499,6 +689,7 @@ extension DecodingError {
 }
 
 extension DecodingError.Context {
+  /// The coding path rendered as a dot-joined string.
   fileprivate var codingPathString: String {
     codingPath.map { $0.stringValue }.joined(separator: ".")
   }
@@ -538,19 +729,21 @@ public enum LenientDecodingErrorCode: Int, Sendable {
   /// **Example:** JSON `{"docs": [{"type": "a"}, 5, {"type": "c"}]}` decoding `docs: [Doc?]`
   case droppedElement = 30
 
-  /// Container Key Issues.
   /// Container type mismatch (expected array, got object; expected object, got string).
-  /// When `nestedUnkeyedContainer` or `nestedContainer` fails.
+  /// Occurs when `nestedUnkeyedContainer` or `nestedContainer` fails.
   case invalidContainer = 40
 
-  /// Two distinct JSON keys convert to same `T` (collision after conversion).
+  /// Two distinct JSON keys convert to the same `T` (collision after conversion).
   /// First wins, subsequent dropped.
   ///
   /// **Example:** JSON `{"tags": {"7": {"type": "a"}, "07": {"type": "b"}}}` decoding `tags: [Int: Doc]`
   case keyCollision = 41
 
+  /// A `DecodingError` case not mapped to a specific code.
   case unknownDecodingError = 50
 
+  /// Internal-only: a synthetic warning created by infrastructure code
+  /// (e.g. double injection, invalid userInfo type). Not a real decode failure.
   case unexpectedCodeEntrance = 100
 }
 
@@ -558,6 +751,11 @@ public enum LenientDecodingErrorCode: Int, Sendable {
 
 // MARK: - Supporting Code
 
+/// A generic lock wrapper providing mutually exclusive access to a value.
+///
+/// This exists because `Swift.Mutex` is only available on macOS 15+ /  iOS 18+.
+/// This library supports iOS 13+ / macOS 10.15+, so we use `NSLock` as the
+/// underlying implementation.
 @available(macOS, deprecated: 15.0, message: "Use Swift.Mutex instead")
 @available(iOS, deprecated: 18.0, message: "Use Swift.Mutex instead")
 @available(tvOS, deprecated: 18.0, message: "Use Swift.Mutex instead")
@@ -570,7 +768,7 @@ private final class NSLock_<Value: ~Copyable>: @unchecked Sendable {
   init(_ value: consuming Value) {
     self.value = value
   }
-
+  
   public func withLock<Result: ~Copyable>(_ body: (inout sending Value) -> sending Result)
     -> sending Result {
     lock.lock(); defer { lock.unlock() }
