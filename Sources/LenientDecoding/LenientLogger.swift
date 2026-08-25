@@ -292,27 +292,36 @@ fileprivate final class PendingEntriesLogger: Sendable {
   }
 
   fileprivate func append(logEntry: LenientDecodingLogEntry) {
+    lazy var overflowMessage = "pending buffer overflow: some decoding warnings were dropped because the global "
+      + "logger was not injected yet"
+
+    #if DEBUG
+      func overflowDebugLog() {
+        var logEntry = logEntry
+        logEntry.annotatePendingBufferOverflow(message: overflowMessage)
+        _globalDebugLogger(logEntry)
+      }
+    #endif
+
     _state.withLock { state in
       if let injectedLogger = state.injectedLogger {
         injectedLogger(logEntry)
       } else if state.pendingEntries.count < _pendingEntriesLimit {
         state.pendingEntries.append(logEntry)
       } else if !state.isOverflowLogged {
-        let message = "pending buffer overflow: some decoding warnings were dropped because the global "
-          + "logger was not injected yet"
         for i in state.pendingEntries.indices {
-          state.pendingEntries[i].annotatePendingBufferOverflow(message: message)
+          state.pendingEntries[i].annotatePendingBufferOverflow(message: overflowMessage)
         }
 
         state.isOverflowLogged = true
 
         #if DEBUG
-          var logEntry = logEntry
-          logEntry.annotatePendingBufferOverflow(message: message)
-          _globalDebugLogger(logEntry)
+          overflowDebugLog()
         #endif
       } else {
-        return
+        #if DEBUG
+          overflowDebugLog()
+        #endif
       }
     }
   }
