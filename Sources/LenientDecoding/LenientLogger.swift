@@ -110,7 +110,7 @@ public typealias LenientDecodingLogger = @Sendable (LenientDecodingLogEntry) -> 
 // MARK: - Inject Logger Once
 
 /// Injects the global log handler. Can only be called once.
-/// Subsequent calls will log a warning via the existing handler.
+/// Subsequent calls will log a ``LenientDecodingLogEntry`` instance via the existing handler.
 ///
 /// The injected logger receives **all** lenient decoding failures in both
 /// DEBUG and RELEASE builds. Without injection, DEBUG builds use the
@@ -127,7 +127,7 @@ public typealias LenientDecodingLogger = @Sendable (LenientDecodingLogEntry) -> 
 ///   - file: Source file (for assertion).
 ///   - line: Source line (for assertion).
 public func inject_once(lenientDecodingLogger logger: @escaping LenientDecodingLogger,
-                        rateLimits: (totalDecodingLimit: UInt8, elementsPerCollectionLimit: UInt8)? = nil,
+                        rateLimits: (perDecodingReportedFieldsLimit: UInt8, elementsPerCollectionLimit: UInt8)? = nil,
                         file: StaticString = #file,
                         line: UInt = #line) {
   let (alreadyInjectedGlobalLogger, pendingEntries) = _globalLogger
@@ -157,11 +157,11 @@ public func inject_once(lenientDecodingLogger logger: @escaping LenientDecodingL
 
   if let alreadyInjectedGlobalLogger {
     let message = "Attempted to inject lenient decoding logger more than once"
-    let logEntry = LenientDecodingLogEntry.internalsImpWarning(message: message)
+    let logEntry = LenientDecodingLogEntry.internalsImpIssue(message: message)
     // Intentionally call BOTH loggers: we cannot assume which
     // logger is the "real" destination for this error – the old one may
     // already be forwarding to the monitoring system, while the new one
-    // may be the caller's debug sink. Both receive the warning so nothing
+    // may be the caller's debug sink. Both receive the logEntry so nothing
     // is silently lost.
     alreadyInjectedGlobalLogger(logEntry)
     logger(logEntry)
@@ -192,14 +192,14 @@ extension Decoder {
   /// Checks `userInfo[.lenientDecodingLogHandler]` first. If a valid
   /// ``_DecoderLoggerBox`` is found its logger is returned. If the box is
   /// missing or has an invalid type, falls back to ``globalLogger`` and
-  /// logs a warning about the misconfiguration.
+  /// logs a logEntry instance about the misconfiguration.
   package var lenientDecodingLogger: LenientDecodingLogger {
     if let value = userInfo[.lenientDecodingLogHandler] {
       if let loggerBox = (value as? _DecoderLoggerBox) {
         return loggerBox.loggerInstance
       } else {
         let message = "Invalid logger type in Decoder.userInfo; falling back to global logger."
-        let logEntry = LenientDecodingLogEntry.internalsImpWarning(message: message)
+        let logEntry = LenientDecodingLogEntry.internalsImpIssue(message: message)
 
         let fallbackLogger = globalLogger
         fallbackLogger(logEntry)
@@ -292,7 +292,7 @@ fileprivate final class PendingEntriesLogger: Sendable {
   }
 
   fileprivate func append(logEntry: LenientDecodingLogEntry) {
-    lazy var overflowMessage = "pending buffer overflow: some decoding warnings were dropped because the global "
+    lazy var overflowMessage = "pending buffer overflow: some decoding issues were dropped because the global "
       + "logger was not injected yet"
 
     #if DEBUG
@@ -390,20 +390,20 @@ fileprivate enum _GlobalLoggerVariant {
 
 /// Two rate-limit values packed into a single `UInt16` for lock-free atomic access.
 ///
-/// - Lower byte: `totalDecodingLimit` – max unique warnings per decoded object.
-/// - Upper byte: `elementsPerCollectionLimit` – max per-element warnings for collection (array/dictionary).
+/// - Lower byte: `perDecodingReportedFieldsLimit` – max issue entries per decoded object.
+/// - Upper byte: `elementsPerCollectionLimit` – max per-element issues for collection (array/dictionary).
 ///
 /// On macOS 15+/iOS 18+ the values can be overridden
 /// via ``inject_once(lenientDecodingLogger:rateLimits:...)``.
 /// On older OS versions the getter returns the hardcoded default `(3, 3)`
 /// and the setter does not available.
-fileprivate var _rateLimits: (totalDecodingLimit: UInt8, elementsPerCollectionLimit: UInt8) {
+fileprivate var _rateLimits: (perDecodingReportedFieldsLimit: UInt8, elementsPerCollectionLimit: UInt8) {
   get {
     if #available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *) {
       let bitpackedLimits = __bitpackedRateLimits.load(ordering: .relaxed)
-      let totalDecodingLimit = UInt8(bitpackedLimits & 0xFF)
+      let perDecodingReportedFieldsLimit = UInt8(bitpackedLimits & 0xFF)
       let elementsPerCollectionLimit = UInt8((bitpackedLimits >> 8) & 0xFF)
-      return (totalDecodingLimit, elementsPerCollectionLimit)
+      return (perDecodingReportedFieldsLimit, elementsPerCollectionLimit)
     } else {
       return (3, 3)
     }
@@ -411,7 +411,7 @@ fileprivate var _rateLimits: (totalDecodingLimit: UInt8, elementsPerCollectionLi
 
   @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
   set {
-    let bitpackedLimits = UInt16.bitpackRateLimits(totalDecodingLimit: newValue.totalDecodingLimit,
+    let bitpackedLimits = UInt16.bitpackRateLimits(perDecodingReportedFieldsLimit: newValue.perDecodingReportedFieldsLimit,
                                                    elementsPerCollectionLimit: newValue.elementsPerCollectionLimit)
     __bitpackedRateLimits.store(bitpackedLimits, ordering: .relaxed)
   }
@@ -420,18 +420,18 @@ fileprivate var _rateLimits: (totalDecodingLimit: UInt8, elementsPerCollectionLi
 /// Atomic storage for the bitpacked rate limits.
 ///
 /// Accessed via ``_rateLimits``. The `UInt16` is split into two bytes:
-/// lower = `totalDecodingLimit`, upper = `elementsPerCollectionLimit`.
+/// lower = `perDecodingReportedFieldsLimit`, upper = `elementsPerCollectionLimit`.
 @available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *)
-fileprivate let __bitpackedRateLimits = Atomic<UInt16>(.bitpackRateLimits(totalDecodingLimit: 3,
+fileprivate let __bitpackedRateLimits = Atomic<UInt16>(.bitpackRateLimits(perDecodingReportedFieldsLimit: 3,
                                                                           elementsPerCollectionLimit: 3))
 extension UInt16 {
   /// Packs two `UInt8` rate limits into a single `UInt16`.
   ///
-  /// - `totalDecodingLimit` occupies the lower byte.
+  /// - `perDecodingReportedFieldsLimit` occupies the lower byte.
   /// - `elementsPerCollectionLimit` occupies the upper byte.
-  fileprivate static func bitpackRateLimits(totalDecodingLimit: UInt8, elementsPerCollectionLimit: UInt8) -> UInt16 {
+  fileprivate static func bitpackRateLimits(perDecodingReportedFieldsLimit: UInt8, elementsPerCollectionLimit: UInt8) -> UInt16 {
     let higherByte = UInt16(elementsPerCollectionLimit) << 8
-    let lowerByte = UInt16(totalDecodingLimit)
+    let lowerByte = UInt16(perDecodingReportedFieldsLimit)
     return higherByte | lowerByte
   }
 }
@@ -442,78 +442,112 @@ extension UInt16 {
 
 // MARK: LogEntry
 
-/// Accumulates all warnings for a single decoded object.
+/// The severity level of a lenient decoding log entry.
+///
+/// Represents the highest-severity issue encountered while decoding a single object.
+/// Starts at `.warning` and upgrades to `.failure` if any `@Strict` property fails
+/// to decode (since `@Strict` failures throw and halt the entire decode).
+///
+/// - Note: This is tracked per ``LenientDecodingLogEntry`` (one per decoded object)
+///   and surfaced to the injected logger for filtering/alerting.
+public enum LenientDecodingLogSeverity: String, Sendable, CustomStringConvertible {
+  /// A lenient decoding issue occurred (absorbed by `@NilOnFailure` or `@DropOnFailure`).
+  /// The decode succeeded but some data was substituted (`nil`, `[]`, dropped).
+  case warning
+
+  /// A strict decoding failure occurred (from `@Strict` property).
+  /// The decode threw and did not produce a value.
+  case failure
+  
+  public var description: String { rawValue }
+
+  /// Upgrades this severity if `newSeverity` is higher.
+  /// Used internally when recording multiple issues for the same object.
+  fileprivate mutating func upgradeBy(_: Self) {
+    guard !(self == .failure) else { return }
+    self = .failure
+  }
+}
+
+/// Accumulates all issues for a single decoded object.
 ///
 /// One instance is created per decoded object.
 ///
 /// Rate limiting is applied at two levels:
-/// - **Per decoded object:** `totalDecodingWarningsLimit` caps the total number
-///   of unique warnings stored. Overflow is tracked in
-///   ``propertyDecodingOverflowedWarnings``.
-/// - **Per collection element:** `collectionElementWarningLimit` caps the number
-///   of per-element warnings stored under a single collection. Overflow is
-///   tracked in the `overflowCount` field of ``collectionElementWarnings``.
+/// - **Per decoded object:** `perDecodingReportedFieldsLimit` caps the total number
+///   of fields (properties + collections) with tracked issues. Overflow is tracked in
+///   ``overflowedFieldIdentities``.
+/// - **Per collection element:** `collectionElementIssuesLimit` caps the number
+///   of per-element issues stored under a single collection. Overflow is
+///   tracked in the `overflowCount` field of ``collectionElementIssues``.
 public struct LenientDecodingLogEntry: Sendable {
-  /// Warnings keyed by their `errorIdentity` (e.g. `"keyNotFound:path.to.field"`).
-  /// Capped at `totalDecodingWarningsLimit` entries per decoded object.
-  public private(set) var propertyDecodingWarnings: [String: LenientDecodingWarning] = [:]
+  /// The highest severity encountered while decoding this object.
+  /// Defaults to `.warning`; upgraded to `.failure` if any `@Strict` property fails.
+  public private(set) var severity: LenientDecodingLogSeverity = .warning
 
-  /// Per-collection drop-on-failure warnings.
+  /// Issues keyed by their `errorIdentity` (e.g. `"keyNotFound:path.to.field"`).
+  /// Capped at `perDecodingReportedFieldsLimit` entries per decoded object.
+  public private(set) var propertyDecodingIssues: [String: LenientDecodingIssue] = [:]
+
+  /// Per-collection element issues.
   ///
   /// Keyed by `"<identityPrefix>:" + collectionPath` (e.g. `"nilPadding:scores"`, `"dropOnFailure:orders"`).
-  /// This key is computed locally, not from the warning's `errorIdentity`,
+  /// This key is computed locally, not from the issue's `errorIdentity`,
   /// because the `DecodingError` context includes the element index, making
-  /// each warning's `errorIdentity` unique per element. Using that would
-  /// split warnings across multiple keys; we want them grouped by collection.
-  /// Each value contains up to `collectionElementWarningLimit` warnings
+  /// each issue's `errorIdentity` unique per element. Using that would
+  /// split issues across multiple keys; we want them grouped by collection.
+  /// Each value contains up to `collectionElementIssuesLimit` issues
   /// and an `overflowCount` for additional dropped elements beyond the limit.
-  public private(set) var collectionElementWarnings: [String: (warnings: [LenientDecodingWarning], overflowCount: UInt)] = [:]
+  public private(set) var collectionElementIssues: [String: (issues: [LenientDecodingIssue], overflowCount: UInt)] = [:]
 
-  /// Error identities for warnings that could not be stored because the total
-  /// per-object rate limit (`totalDecodingWarningsLimit`) was reached.
-  /// This includes both property-level warnings (from `@NilOnFailure`/`@Strict`)
-  /// and collection element warnings that couldn't create a new entry.
-  public private(set) var propertyDecodingOverflowedWarnings: Set<String> = []
+  /// Field identities for issues that could not be stored because the total
+  /// per-object rate limit (`perDecodingReportedFieldsLimit`) was reached.
+  /// This includes both property-level issues (from `@NilOnFailure`/`@Strict`)
+  /// and collection element issues that couldn't create a new entry.
+  public private(set) var overflowedFieldIdentities: Set<String> = []
 
   // MARK: - Rate Limits
 
-  /// Maximum number of unique warnings stored per decoded object.
+  /// Maximum number of fields (properties + collections) with tracked issues per decoded object.
   /// Captured from ``_rateLimits`` at initialization.
-  private let totalDecodingWarningsLimit: UInt8
+  private let perDecodingReportedFieldsLimit: UInt8
 
-  /// Maximum number of element warnings stored per collection.
+  /// Maximum number of element issues stored per collection.
   /// Captured from ``_rateLimits`` at initialization.
-  private let collectionElementWarningsLimit: UInt8
+  private let collectionElementIssuesLimit: UInt8
 
-  /// `true` when the combined count of `propertyDecodingWarnings` and
-  /// `collectionElementWarnings` has reached `totalDecodingWarningsLimit`.
-  private var isTotalDecodingRateLimitReached: Bool {
-    (propertyDecodingWarnings.count + collectionElementWarnings.count) >= totalDecodingWarningsLimit
+  /// `true` when the combined count of `propertyDecodingIssues` and
+  /// `collectionElementIssues` has reached `perDecodingReportedFieldsLimit`.
+  private var isPerDecodingReportedFieldsLimitReached: Bool {
+    (propertyDecodingIssues.count + collectionElementIssues.count) >= perDecodingReportedFieldsLimit
   }
 
   /// Creates a new entry, snapshotting the current rate limits from ``_rateLimits``.
   fileprivate init() {
     let rateLimits = _rateLimits
-    totalDecodingWarningsLimit = rateLimits.totalDecodingLimit
-    collectionElementWarningsLimit = rateLimits.elementsPerCollectionLimit
+    perDecodingReportedFieldsLimit = rateLimits.perDecodingReportedFieldsLimit
+    collectionElementIssuesLimit = rateLimits.elementsPerCollectionLimit
   }
 
   /// Records a property-level decoding failure.
   ///
-  /// If the total rate limit has not been reached, the warning is stored in
-  /// ``propertyDecodingWarnings``; otherwise only the `errorIdentity` is
-  /// recorded in ``propertyDecodingOverflowedWarnings``.
+  /// If the total rate limit has not been reached, the issue is stored in
+  /// ``propertyDecodingIssues``; otherwise only the `errorIdentity` is
+  /// recorded in ``propertyDecodingOverflowedIssues``.
   ///
   /// - Parameters:
   ///   - propertySingleValueDecodingError: The `DecodingError` absorbed by a `LenientDecoding`.
-  ///   - decodingStrategy: The strategy annotation (e.g. `"@NilOnFailure"`).
+  ///   - decodingStrategy: The strategy annotation (e.g. `"@Strict"`).
+  ///   - severity: The severity of this issue (`.warning` for lenient, `.failure` for `@Strict`).
   package mutating func append(propertySingleValueDecodingError: DecodingError,
-                               decodingStrategy: String) {
-    let warning = propertySingleValueDecodingError.asWarning(decodingStrategy: decodingStrategy)
-    if isTotalDecodingRateLimitReached {
-      propertyDecodingOverflowedWarnings.insert(warning.errorIdentity)
+                               decodingStrategy: String,
+                               severity: LenientDecodingLogSeverity) {
+    self.severity.upgradeBy(severity)
+    let issue = propertySingleValueDecodingError.asIssue(decodingStrategy: decodingStrategy, severity: severity)
+    if isPerDecodingReportedFieldsLimitReached {
+      overflowedFieldIdentities.insert(issue.errorIdentity)
     } else {
-      propertyDecodingWarnings[warning.errorIdentity] = warning
+      propertyDecodingIssues[issue.errorIdentity] = issue
     }
   }
 
@@ -525,23 +559,25 @@ public struct LenientDecodingLogEntry: Sendable {
   /// The error is grouped under an identity key derived from the strategy name and the
   /// dictionary's property path (e.g., `"@NilOnFailure:user.addresses"`). This allows
   /// multiple failed values in the same dictionary to be grouped together in
-  /// ``collectionElementWarnings`` with a shared overflow counter.
+  /// ``collectionElementIssues`` with a shared overflow counter.
   ///
   /// Rate limiting is applied at two levels:
-  /// - **Per decoded object:** Capped by `totalDecodingWarningsLimit`
-  /// - **Per dictionary:** Capped by `collectionElementWarningLimit` (per-element warnings stored)
+  /// - **Per decoded object:** Capped by `perDecodingReportedFieldsLimit`
+  /// - **Per dictionary:** Capped by `collectionElementIssuesLimit` (per-element issues stored)
   ///
   /// - Parameters:
   ///   - dictionaryValueError: The `DecodingError` absorbed while decoding a dictionary value.
   ///   - key: The dictionary property key.
   ///   - keyedContainer: The keyed container of dictionary key-value pairs.
   ///   - strategy: The leniency strategy annotation (e.g., `"@NilOnFailure"`, `"@DropOnFailure"`).
+  ///   - severity: The severity of this issue (`.warning` for lenient, `.failure` for `@Strict`).
   package mutating func append<Key: CodingKey>(dictionaryValueError: DecodingError,
                                                dictionaryPropertyKey key: Key,
                                                keyedContainer: KeyedDecodingContainer<Key>,
-                                               strategy: String) {
+                                               strategy: String,
+                                               severity: LenientDecodingLogSeverity) {
     let identity = errorIdentity(prefix: strategy, path: loggingPath(ofKeyedContainer: keyedContainer, key: key))
-    append(elementError: dictionaryValueError, identity: identity, strategy: strategy)
+    append(elementError: dictionaryValueError, identity: identity, strategy: strategy, severity: severity)
   }
 
   /// Records an array element decoding failure for a specific index.
@@ -552,23 +588,25 @@ public struct LenientDecodingLogEntry: Sendable {
   /// The error is grouped under an identity key derived from the strategy name and the
   /// array's coding path (e.g., `"@DropOnFailure:orders"`).
   /// This allows multiple failed elements in the same array to be grouped together in
-  /// ``collectionElementWarnings`` with a shared overflow counter.
+  /// ``collectionElementIssues`` with a shared overflow counter.
   ///
   /// Rate limiting is applied at two levels:
-  /// - **Per decoded object:** Capped by `totalDecodingWarningsLimit`
-  /// - **Per array:** Capped by `collectionElementWarningLimit` (per-element warnings stored)
+  /// - **Per decoded object:** Capped by ``perDecodingReportedFieldsLimit``
+  /// - **Per array / dictionary:** Capped by ``collectionElementIssuesLimit``
   ///
   /// - Parameters:
   ///   - arrayElementError: The `DecodingError` absorbed while decoding an array element.
   ///   - key: The array property key.
   ///   - unkeyedContainer: The unkeyed container of array property.
   ///   - strategy: The leniency strategy annotation (e.g., `"@NilOnFailure"`, `"@DropOnFailure"`).
+  ///   - severity: The severity of this issue (`.warning` for lenient, `.failure` for `@Strict`).
   package mutating func append(arrayElementError: DecodingError,
                                arrayPropertyKey key: some CodingKey,
                                unkeyedContainer: UnkeyedDecodingContainer,
-                               strategy: String) {
+                               strategy: String,
+                               severity: LenientDecodingLogSeverity) {
     let identity = errorIdentity(prefix: strategy, path: loggingPath(ofUnkeyedContainer: unkeyedContainer, key: key))
-    append(elementError: arrayElementError, identity: identity, strategy: strategy)
+    append(elementError: arrayElementError, identity: identity, strategy: strategy, severity: severity)
   }
 
   /// Records a collection element error for a specific array or dictionary key.
@@ -576,78 +614,82 @@ public struct LenientDecodingLogEntry: Sendable {
   /// Used by both ``LenientDecoding/nilPadding(_:in:forKey:decoder:)`` (for `[T?]`/`[T?]?`)
   /// and ``LenientDecoding/dropOnFailure(_:in:forKey:decoder:)`` (for `[T]`/`[K: V]`).
   ///
-  /// The first `collectionElementWarningLimit` warnings per collection
-  /// are stored in ``collectionElementWarnings``; beyond that only an
+  /// The first ``collectionElementIssuesLimit`` issues per collection
+  /// are stored in ``collectionElementIssues``; beyond that only an
   /// `overflowCount` is incremented. If the total rate limit has already been
-  /// reached, the identity is added to ``propertyDecodingOverflowedWarnings``
+  /// reached, the identity is added to ``propertyDecodingOverflowedIssues``
   /// instead of creating a new entry.
   ///
   /// - Parameters:
   ///   - elementError: The `DecodingError` absorbed for this element.
-  ///   - identity: The stable identity key for grouping warnings (e.g., `"@NilOnFailure:orders"`).
+  ///   - identity: The stable identity key for grouping issues (e.g., `"@NilOnFailure:orders"`).
   ///     This is precomputed by the caller using the strategy name and the collection's coding path.
-  ///     All failures sharing the same identity are grouped under one entry in ``collectionElementWarnings``
+  ///     All failures sharing the same identity are grouped under one entry in ``collectionElementIssues``
   ///     with a shared `overflowCount`.
   ///   - strategy: The lenient strategy annotation (e.g. `"@DropOnFailure"`, `"@NilOnFailure"`).
+  ///   - severity: The severity of this issue (`.warning` for lenient, `.failure` for `@Strict`).
+  ///     Upgrades the log entry's overall severity via ``LenientDecodingLogSeverity/upgradeBy(_:)``.
   private mutating func append(elementError: DecodingError,
                                identity: String,
-                               strategy: String) {
-    lazy var warning = elementError.asWarning(decodingStrategy: strategy)
+                               strategy: String,
+                               severity: LenientDecodingLogSeverity) {
+    self.severity.upgradeBy(severity)
+    lazy var issue = elementError.asIssue(decodingStrategy: strategy, severity: severity)
 
-    let index = collectionElementWarnings.index(forKey: identity)
-    if let index {
-      if collectionElementWarnings.values[index].warnings.count < collectionElementWarningsLimit {
-        collectionElementWarnings.values[index].warnings.append(warning)
+    if let index = collectionElementIssues.index(forKey: identity) {
+      if collectionElementIssues.values[index].issues.count < collectionElementIssuesLimit {
+        collectionElementIssues.values[index].issues.append(issue)
       } else {
-        collectionElementWarnings.values[index].overflowCount += 1
+        collectionElementIssues.values[index].overflowCount += 1
       }
     } else {
-      if isTotalDecodingRateLimitReached {
-        // As total limit reached, it is not possible to add entry, so add info to `propertyDecodingOverflowedWarnings`
-        // signaling that there were warnings for Collection property as a whole instead of per-element info.
-        propertyDecodingOverflowedWarnings.insert(identity)
+      if isPerDecodingReportedFieldsLimitReached {
+        // As total limit reached, it is not possible to add entry, so add info to ``overflowedFieldIdentities``
+        // signaling that there were issues for Collection property as a whole instead of per-element info.
+        overflowedFieldIdentities.insert(identity)
       } else {
-        collectionElementWarnings[identity, default: ([], 0)].warnings.append(warning)
+        collectionElementIssues[identity, default: ([], 0)].issues.append(issue)
       }
     }
   }
 }
 
 extension LenientDecodingLogEntry {
-  // MARK: Synthetic warning for internal logging
+  // MARK: Synthetic issue for internal logging
 
-  /// Creates a synthetic entry containing a single internal warning.
+  /// Creates a synthetic entry containing a single internal issue.
   ///
   /// Used by ``inject_once`` and ``Decoder.lenientDecodingLogger`` to report
   /// infrastructure issues (e.g. double injection, invalid userInfo type)
   /// without going through the normal decode path.
-  fileprivate static func internalsImpWarning(message: String) -> Self {
+  fileprivate static func internalsImpIssue(message: String) -> Self {
     var entry = Self()
-    let code = LenientDecodingErrorCode.unexpectedCodeEntrance
-    let warning = LenientDecodingWarning(errorIdentity: "\(code)",
-                                         code: code,
-                                         path: "",
-                                         strategy: "",
-                                         underlyingError: nil,
-                                         info: ["message": message])
-    entry.propertyDecodingWarnings[warning.errorIdentity] = warning
+    let code = LenientDecodingIssueCode.unexpectedCodeEntrance
+    let issue = LenientDecodingIssue(errorIdentity: "\(code)",
+                                     severity: .failure,
+                                     code: code,
+                                     path: "",
+                                     decodingStrategy: "",
+                                     underlyingError: nil,
+                                     info: ["message": message])
+    entry.propertyDecodingIssues[issue.errorIdentity] = issue
     return entry
   }
 
-  /// Annotates the first warning in this entry with a `"pendingBufferOverflow"` info key.
+  /// Annotates issues in this entry with a `"pendingBufferOverflow"` info key.
   ///
   /// Called by ``PendingEntriesLogger`` when its buffer is full, signaling that
-  /// some warnings for this decoded object were dropped because the global
+  /// some issues for this decoded object were dropped because the global
   /// logger had not been injected yet.
   fileprivate mutating func annotatePendingBufferOverflow(message: String) {
     let messageKey = "pendingBufferOverflowOccured"
-    if !propertyDecodingWarnings.isEmpty {
-      for index in propertyDecodingWarnings.indices {
-        propertyDecodingWarnings.values[index].info[messageKey] = message
+    if !propertyDecodingIssues.isEmpty {
+      for index in propertyDecodingIssues.indices {
+        propertyDecodingIssues.values[index].info[messageKey] = message
       }
-    } else if !collectionElementWarnings.isEmpty {
-      for index in collectionElementWarnings.indices where !collectionElementWarnings.values[index].warnings.isEmpty {
-        collectionElementWarnings.values[index].warnings[0].info[messageKey] = message
+    } else if !collectionElementIssues.isEmpty {
+      for index in collectionElementIssues.indices where !collectionElementIssues.values[index].issues.isEmpty {
+        collectionElementIssues.values[index].issues[0].info[messageKey] = message
       }
     }
   }
@@ -658,8 +700,8 @@ extension LenientDecodingLogEntry {
 ///
 /// This path identifies the location of a value in the JSON structure.
 /// It's used as part of the `errorIdentity` (e.g. `"keyNotFound:order.status"`)
-/// to group and look up warnings in ``LenientDecodingLogEntry/propertyDecodingWarnings``
-/// and ``LenientDecodingLogEntry/collectionElementWarnings``.
+/// to group and look up issues in ``LenientDecodingLogEntry/propertyDecodingIssues``
+/// and ``LenientDecodingLogEntry/collectionElementIssues``.
 ///
 /// The container's `codingPath` (the walk from the JSON root to the container)
 /// is extended with `key`, and each component's `stringValue` is joined with `.`.
@@ -681,24 +723,24 @@ package func loggingPath(ofUnkeyedContainer container: some UnkeyedDecodingConta
   (container.codingPath + [key]).map { $0.stringValue }.joined(separator: ".")
 }
 
-/// Builds a stable string identity for a warning from a prefix and coding path.
+/// Builds a stable string identity for an issue from a prefix and coding path.
 ///
-/// Used as dictionary keys in ``LenientDecodingLogEntry/propertyDecodingWarnings``
-/// and ``LenientDecodingLogEntry/collectionElementWarnings``. The format is
+/// Used as dictionary keys in ``LenientDecodingLogEntry/propertyDecodingIssues``
+/// and ``LenientDecodingLogEntry/collectionElementIssues``. The format is
 /// `"<prefix>:<path>"` (e.g. `"keyNotFound:order.status"`).
 fileprivate func errorIdentity(prefix: String, path: String) -> String {
   prefix + ":" + path
 }
 
-// MARK: Decoding Warning
+// MARK: Decoding Issue
 
-/// A single structured warning for a lenient decoding failure.
+/// A single structured issue for a lenient decoding failure.
 /// Contains all context needed for debugging and monitoring.
 ///
 /// One ``LenientDecodingLogEntry`` (per decoded object) collects multiple
-/// ``LenientDecodingWarning`` values – one for each absorbed failure.
-public struct LenientDecodingWarning: Sendable {
-  /// Stable string used as the dictionary key in ``LenientDecodingLogEntry/propertyDecodingWarnings``.
+/// ``LenientDecodingIssue`` instances – one for each absorbed failure.
+public struct LenientDecodingIssue: Sendable {
+  /// Stable string used as the dictionary key in ``LenientDecodingLogEntry/propertyDecodingIssues``.
   /// Format: `"<errorType>:<codingPath>"` (e.g. `"keyNotFound:order.status"`).
   ///
   /// For property-level failures (`@NilOnFailure`, `@Strict`), this is the lookup key.
@@ -710,7 +752,7 @@ public struct LenientDecodingWarning: Sendable {
   fileprivate let errorIdentity: String
 
   /// Numeric category of the failure (see ``LenientDecodingErrorCode``).
-  public let code: LenientDecodingErrorCode
+  public let code: LenientDecodingIssueCode
 
   /// Dot-joined coding path from the JSON root to the failing value.
   public let path: String
@@ -725,18 +767,19 @@ public struct LenientDecodingWarning: Sendable {
   /// - `"contextDebugDescription"` — the `DecodingError.Context.debugDescription`.
   /// - `"expectedType"` — the type that was expected (for `typeMismatch`/`valueNotFound`).
   /// - `"missingKey"` — the absent key (for `keyNotFound`).
-  public fileprivate(set) var info: [String: any Sendable & CustomStringConvertible]
-
-  /// Creates a warning, automatically storing `strategy` in `info["strategy"]`.
+  public fileprivate(set) var info: [String: any Sendable & CustomStringConvertible & Encodable]
+  
   fileprivate init(errorIdentity: String,
-                   code: LenientDecodingErrorCode,
+                   severity: LenientDecodingLogSeverity,
+                   code: LenientDecodingIssueCode,
                    path: String,
-                   strategy: String,
+                   decodingStrategy: String,
                    underlyingError: (any Error)?,
-                   info: consuming [String: any Sendable & CustomStringConvertible]) {
+                   info: consuming [String: any Sendable & CustomStringConvertible & Encodable]) {
+    info["severity"] = "\(severity)"
     info["code"] = "\(code)"
     info["path"] = path
-    info["strategy"] = strategy
+    info["decodingStrategy"] = decodingStrategy
     if let underlyingError {
       let descriptions = [
         ("underlyingErrorDebugDescription", String(reflecting: underlyingError)),
@@ -759,59 +802,64 @@ public struct LenientDecodingWarning: Sendable {
   }
 }
 
-// MARK: DecodingError as Warning
+// MARK: DecodingError as Issue
 
 extension DecodingError {
-  /// Converts a `DecodingError` into a structured ``LenientDecodingWarning``.
+  /// Converts a `DecodingError` into a structured ``LenientDecodingIssue``.
   /// - Parameters:
   ///   - decodingStrategy: The strategy annotation passed by the macro, e.g. `"@NilOnFailure"`, `"@DropOnFailure"`, `"@Strict"`.
-  /// - Returns: A ``LenientDecodingWarning`` populated from the error's type, context, and underlying error.
-  fileprivate func asWarning(decodingStrategy: String) -> LenientDecodingWarning {
+  /// - Returns: A ``LenientDecodingIssue`` populated from the error's type, context, and underlying error.
+  fileprivate func asIssue(decodingStrategy: String, severity: LenientDecodingLogSeverity) -> LenientDecodingIssue {
     let contextDebugDescrKey = "contextDebugDescription"
     switch self {
     case let .typeMismatch(type, context):
       let contextPath = context.codingPathString
-      return LenientDecodingWarning(errorIdentity: errorIdentity(prefix: "typeMismatch", path: contextPath),
-                                    code: .typeMismatch,
-                                    path: contextPath,
-                                    strategy: decodingStrategy,
-                                    underlyingError: context.underlyingError,
-                                    info: [contextDebugDescrKey: context.debugDescription, "expectedType": "\(type)"])
+      return LenientDecodingIssue(errorIdentity: errorIdentity(prefix: "typeMismatch", path: contextPath),
+                                  severity: severity,
+                                  code: .typeMismatch,
+                                  path: contextPath,
+                                  decodingStrategy: decodingStrategy,
+                                  underlyingError: context.underlyingError,
+                                  info: [contextDebugDescrKey: context.debugDescription, "expectedType": "\(type)"])
 
     case let .keyNotFound(key, context):
       let contextPath = context.codingPathString
-      return LenientDecodingWarning(errorIdentity: errorIdentity(prefix: "keyNotFound", path: contextPath),
-                                    code: .keyNotFound,
-                                    path: contextPath,
-                                    strategy: decodingStrategy,
-                                    underlyingError: context.underlyingError,
-                                    info: [contextDebugDescrKey: context.debugDescription, "missingKey": "\(key)"])
+      return LenientDecodingIssue(errorIdentity: errorIdentity(prefix: "keyNotFound", path: contextPath),
+                                  severity: severity,
+                                  code: .keyNotFound,
+                                  path: contextPath,
+                                  decodingStrategy: decodingStrategy,
+                                  underlyingError: context.underlyingError,
+                                  info: [contextDebugDescrKey: context.debugDescription, "missingKey": "\(key)"])
 
     case let .valueNotFound(type, context):
       let contextPath = context.codingPathString
-      return LenientDecodingWarning(errorIdentity: errorIdentity(prefix: "valueNotFound", path: contextPath),
-                                    code: .valueNotFound,
-                                    path: contextPath,
-                                    strategy: decodingStrategy,
-                                    underlyingError: context.underlyingError,
-                                    info: [contextDebugDescrKey: context.debugDescription, "expectedType": "\(type)"])
+      return LenientDecodingIssue(errorIdentity: errorIdentity(prefix: "valueNotFound", path: contextPath),
+                                  severity: severity,
+                                  code: .valueNotFound,
+                                  path: contextPath,
+                                  decodingStrategy: decodingStrategy,
+                                  underlyingError: context.underlyingError,
+                                  info: [contextDebugDescrKey: context.debugDescription, "expectedType": "\(type)"])
 
     case .dataCorrupted(let context):
       let contextPath = context.codingPathString
-      return LenientDecodingWarning(errorIdentity: errorIdentity(prefix: "dataCorrupted", path: contextPath),
-                                    code: .dataCorrupted,
-                                    path: contextPath,
-                                    strategy: decodingStrategy,
-                                    underlyingError: context.underlyingError,
-                                    info: [contextDebugDescrKey: context.debugDescription])
+      return LenientDecodingIssue(errorIdentity: errorIdentity(prefix: "dataCorrupted", path: contextPath),
+                                  severity: severity,
+                                  code: .dataCorrupted,
+                                  path: contextPath,
+                                  decodingStrategy: decodingStrategy,
+                                  underlyingError: context.underlyingError,
+                                  info: [contextDebugDescrKey: context.debugDescription])
 
     @unknown default:
-      return LenientDecodingWarning(errorIdentity: "unknown:\(Self.self):" + decodingStrategy,
-                                    code: .unknownDecodingError,
-                                    path: "",
-                                    strategy: decodingStrategy,
-                                    underlyingError: nil,
-                                    info: [:])
+      return LenientDecodingIssue(errorIdentity: "unknown:\(Self.self):" + decodingStrategy,
+                                  severity: severity,
+                                  code: .unknownDecodingError,
+                                  path: "",
+                                  decodingStrategy: decodingStrategy,
+                                  underlyingError: nil,
+                                  info: [:])
     }
   }
 }
@@ -828,7 +876,7 @@ extension DecodingError.Context {
 /// Internal error codes for categorizing lenient decoding failures.
 /// These are stable identifiers used for filtering and aggregation.
 /// Values match `DecodingError` codes where applicable (0-29), then lenient-specific (30+).
-public enum LenientDecodingErrorCode: Int, Sendable {
+public enum LenientDecodingIssueCode: Int, Sendable {
   /// Key is absent from JSON object.
   /// Maps to `DecodingError.keyNotFound`.
   ///
@@ -872,7 +920,7 @@ public enum LenientDecodingErrorCode: Int, Sendable {
   /// A `DecodingError` case not mapped to a specific code.
   case unknownDecodingError = 50
 
-  /// Internal-only: a synthetic warning created by infrastructure code
+  /// Internal-only: a synthetic issue created by infrastructure code
   /// (e.g. double injection, invalid userInfo type). Not a real decode failure.
   case unexpectedCodeEntrance = 100
 }
