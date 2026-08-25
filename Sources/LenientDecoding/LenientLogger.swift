@@ -753,10 +753,7 @@ public struct LenientDecodingIssue: Sendable {
 
   /// Numeric category of the failure (see ``LenientDecodingErrorCode``).
   public let code: LenientDecodingIssueCode
-
-  /// Dot-joined coding path from the JSON root to the failing value.
-  public let path: String
-
+  
   /// The underlying error from the `DecodingError.Context`, if available.
   /// This is the error that caused the decoding failure (e.g. a date parsing error
   /// that triggered a `typeMismatch`), not the `DecodingError` itself.
@@ -796,7 +793,6 @@ public struct LenientDecodingIssue: Sendable {
     }
     self.errorIdentity = errorIdentity
     self.code = code
-    self.path = path
     self.underlyingError = underlyingError
     self.info = info
   }
