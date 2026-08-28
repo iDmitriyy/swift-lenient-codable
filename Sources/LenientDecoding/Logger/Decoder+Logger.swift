@@ -16,7 +16,7 @@ extension JSONDecoder {
   /// are routed to `logHandler` instead of the global log handler. Useful for
   /// isolating logs per decoder or for testing.
   ///
-  /// - Parameter logHandler: The log handler to receive failures from this decoder.
+  /// - Parameter effectiveLogHandler: The log handler to receive failures from this decoder.
   public func setLenientDecodingLogHandler(_ logHandler: @escaping LenientDecodingLogHandler) {
     userInfo[.lenientDecodingLogHandler] = _LogHandlerBox(logHandler: logHandler)
   }
@@ -24,20 +24,58 @@ extension JSONDecoder {
 
 extension Decoder {
   /// Returns either logger provided via `Decoder.userInfo` or injected global log handler.
-  package var logHandler: LenientDecodingLogHandler {
+  ///
+  /// Logging Pipeline:
+  /// ```
+  ///           ┌──────────────────────────────────────────┐
+  ///           │                                          │
+  ///           │    Decoder.effectiveLogHandler(entry)    │
+  ///           └────────────────────┬─────────────────────┘
+  ///                                │
+  ///                                ▼
+  ///           ┌──────────────────────────────────────────┐
+  ///           │         effectiveLogHandler              │
+  ///           │           (routing block)                │
+  ///           └──────┬────────────────────────────┬──────┘
+  ///                  │                            │
+  ///                  │                            ▼
+  ///                  │                   ┌────────────────────────┐
+  ///                  │                   │ _debug_GlobalLogHandler│
+  ///       Decoder handler is set         │    (only DEBUG builds) │
+  ///                  ┬                   └────────────────────────┘
+  ///    yes ┌─────────┴───────────┐ no
+  ///        ▼                     ▼
+  /// ┌─────────────┐ ┌──────────────────────────┐
+  /// │ per-decoder │ │     globalLogHandler     │
+  /// │  handler    │ │(injected via inject_once)│
+  /// └─────────────┘ └──────────────────────────┘
+  /// ```
+  package var effectiveLogHandler: LenientDecodingLogHandler {
+    let decoderLogHandler: LenientDecodingLogHandler?
     if let value = userInfo[.lenientDecodingLogHandler] {
       if let box = (value as? _LogHandlerBox) {
-        return box.logHandler
+        decoderLogHandler = box.logHandler
       } else {
-        let message = "Invalid logger type in Decoder.userInfo; falling back to global logger."
-        let internalsIssue = LenientDecodingLogEntry.internalsImpIssue(message: message)
+        lazy var message = "Invalid logger type in Decoder.userInfo; falling back to global logger."
+        lazy var internalsIssue = LenientDecodingLogEntry.internalsImpIssue(message: message)
 
-        let fallbackLogHandler = LenientErrorLogger.globalLogHandler
-        fallbackLogHandler(internalsIssue)
-        return fallbackLogHandler
+        #if DEBUG
+          LenientErrorLogger._debug_GlobalLogHandler(internalsIssue)
+        #endif
+        LenientErrorLogger.globalLogHandler?(internalsIssue)
+        
+        decoderLogHandler = nil
       }
     } else {
-      return LenientErrorLogger.globalLogHandler
+      decoderLogHandler = nil
+    }
+
+    return { logEntry in
+      #if DEBUG
+        LenientErrorLogger._debug_GlobalLogHandler(logEntry)
+      #endif
+      let handler = decoderLogHandler ?? LenientErrorLogger.globalLogHandler
+      handler?(logEntry)
     }
   }
 }
@@ -51,5 +89,5 @@ fileprivate struct _LogHandlerBox: Sendable {
 
 extension CodingUserInfoKey {
   /// UserInfo key for per-decoder log handler.
-  package static let lenientDecodingLogHandler = CodingUserInfoKey(rawValue: "lenientDecodingLogHandler")!
+  package static let lenientDecodingLogHandler = CodingUserInfoKey(rawValue: "_lenientDecodingLogHandler")!
 }

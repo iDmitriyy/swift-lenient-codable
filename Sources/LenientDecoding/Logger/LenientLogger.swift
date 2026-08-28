@@ -58,7 +58,7 @@ public enum LenientErrorLogger {
   ///   payload fragments embedded in the underlying `DecodingError` appear
   ///   unredacted in the unified log. Do not route sensitive payloads
   ///   through it outside of local debugging.
-  @available(*, deprecated, message: "Use `Decoder.logHandler` instead")
+  @available(*, deprecated, message: "Use `Decoder.effectiveLogHandler` instead")
   static func log(_ message: @escaping @autoclosure () -> String) {
     #if DEBUG
       #if canImport(os)

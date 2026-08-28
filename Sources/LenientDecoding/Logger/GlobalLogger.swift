@@ -36,30 +36,18 @@ extension LenientErrorLogger {
     file: StaticString = #file,
     line: UInt = #line,
   ) {
-    let (alreadyInjectedGlobalLogger, pendingEntries) = _globalLogHandler
-      .withLock { variant -> (LenientDecodingLogHandler?, [LenientDecodingLogEntry]) in
-        switch variant {
-        case .injected(let injectedGlobalLogger):
-          return (injectedGlobalLogger, [])
-        case .pending(let pendingEntriesLogger):
+    let alreadyInjectedGlobalLogger = _globalLogHandler
+      .withLock { injectedGlobalLogger -> LenientDecodingLogHandler? in
+        if let injectedGlobalLogger {
+          return injectedGlobalLogger
+        } else {
           if #available(macOS 15.0, iOS 18.0, watchOS 11.0, tvOS 18.0, visionOS 2.0, *), let rateLimits {
             _rateLimits = rateLimits
           } // else {} // on older OS versions rate limit is constant and can not be overriden
-
-          // Drain buffered entries and set forwarding single atomic transaction.
-          // Stale references of `pendingEntriesLogger` after the drain route new entries
-          // directly to `injected logger` instead of being silently lost.
-          let pendingEntries = pendingEntriesLogger.extractPendingEntriesAndForwardNew(toInjectedLogger: logger)
-
-          variant = .injected(logger)
-
-          return (nil, pendingEntries)
+          injectedGlobalLogger = logger
+          return nil
         }
       }
-
-    for entry in pendingEntries {
-      logger(entry)
-    }
 
     if let alreadyInjectedGlobalLogger {
       let message = "Attempted to inject lenient decoding logger more than once"
@@ -85,14 +73,8 @@ extension LenientErrorLogger {
   /// calls ``extractPendingEntriesAndForwardNew(toInjectedLogger:)``, the old
   /// ``PendingEntriesLogger`` is updated so any subsequent `append` calls on it
   /// route directly to the injected log handler.
-  internal static var globalLogHandler: LenientDecodingLogHandler {
-    { logEntry in
-      #if DEBUG
-        _debug_GlobalLogHandler(logEntry)
-      #endif
-      let globalLogHandler = _globalLogHandler.withLock { $0.instance }
-      globalLogHandler(logEntry)
-    }
+  internal static var globalLogHandler: LenientDecodingLogHandler? {
+    _globalLogHandler.withLock { injectedGlobalHandler in injectedGlobalHandler }
   }
 
   // MARK: Debug Global Logger
@@ -126,27 +108,7 @@ extension LenientErrorLogger {
 
 extension LenientErrorLogger {
   /// Thread-safe storage for the current global logger variant.
-  fileprivate static let _globalLogHandler = _NSLock(_GlobalLoggerVariant.pending(PendingEntriesLogger()))
-
-  /// Represents the two states of the global logger lifecycle.
-  fileprivate enum _GlobalLoggerVariant {
-    /// Logger not yet injected. Entries are buffered in the associated
-    /// ``PendingEntriesLogger`` until ``inject_once`` drains and forwards
-    /// them to the injected logger.
-    case pending(PendingEntriesLogger)
-    
-    /// Logger injected. Entries are logged by associated handler.
-    case injected(LenientDecodingLogHandler)
-    
-    var instance: LenientDecodingLogHandler {
-      switch self {
-      case .pending(let pendingEntriesLogger):
-        { logEntry in pendingEntriesLogger.append(logEntry: logEntry) }
-      case .injected(let injectedLogger):
-        injectedLogger
-      }
-    }
-  }
+  fileprivate static let _globalLogHandler = _NSLock((LenientDecodingLogHandler?).none)
 }
 
 // MARK: Rate Limits

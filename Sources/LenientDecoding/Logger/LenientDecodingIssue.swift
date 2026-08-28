@@ -40,7 +40,7 @@ public struct LenientDecodingIssue: Sendable {
                 path: String,
                 decodingStrategy: String,
                 underlyingError: (any Error)?,
-                info: consuming[String: any Sendable & CustomStringConvertible & Encodable]) {
+                info: consuming [String: any Sendable & CustomStringConvertible & Encodable]) {
     info["severity"] = "\(severity)"
     info["code"] = "\(code)"
     info["path"] = path

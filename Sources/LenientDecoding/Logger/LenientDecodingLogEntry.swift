@@ -197,8 +197,11 @@ public enum LenientDecodingLogSeverity: String, Sendable, CustomStringConvertibl
 // MARK: - Synthetic issue
 
 extension LenientDecodingLogEntry {
-  internal static func internalsImpIssue(message: String) -> Self {
+  internal static func internalsImpIssue(message: String,
+                                         info: consuming [String: any Sendable & CustomStringConvertible & Encodable] = [:])
+    -> Self {
     var entry = Self()
+    info["internalsImpIssueMessage"] = message
     let code = LenientDecodingIssueCode.unexpectedCodeEntrance
     let issue = LenientDecodingIssue(errorIdentity: "\(code)",
                                      severity: .failure,
@@ -206,7 +209,7 @@ extension LenientDecodingLogEntry {
                                      path: "",
                                      decodingStrategy: "",
                                      underlyingError: nil,
-                                     info: ["message": message])
+                                     info: info)
     entry.propertyDecodingIssues[issue.errorIdentity] = issue
     return entry
   }
