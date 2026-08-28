@@ -83,8 +83,12 @@ extension Decoder {
 /// Closures cannot be stored directly in `[CodingUserInfoKey: any Sendable]`
 /// because they are not `Sendable`-conforming types. This wrapper conforms to
 /// `Sendable` and holds the `LogHandler`.
-fileprivate struct _LogHandlerBox: Sendable {
+internal final class _LogHandlerBox: Sendable {
   let logHandler: LenientDecodingLogHandler
+  
+  init(logHandler: @escaping LenientDecodingLogHandler) {
+    self.logHandler = logHandler
+  }
 }
 
 extension CodingUserInfoKey {
